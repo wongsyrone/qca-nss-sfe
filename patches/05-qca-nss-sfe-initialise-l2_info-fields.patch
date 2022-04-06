@@ -1,0 +1,40 @@
+From c28f817d8c07bc0ce8115eb02ffeb901f8fb1216 Mon Sep 17 00:00:00 2001
+From: Nitin Shetty <quic_nitinsj@quicinc.com>
+Date: Fri, 4 Feb 2022 16:23:46 +0530
+Subject: [PATCH] [qca-nss-sfe] initialise l2_info fields
+
+Change-Id: I965a5a89be0cb50e308e4d873adcf627ec1f0787
+Signed-off-by: Nitin Shetty <quic_nitinsj@quicinc.com>
+---
+ sfe_ipv4.c | 3 +--
+ sfe_ipv6.c | 4 +++-
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+--- a/sfe_ipv4.c
++++ b/sfe_ipv4.c
+@@ -2374,8 +2374,7 @@ static void sfe_ipv4_conn_match_hash_ini
+  */
+ static unsigned int sfe_ipv4_local_out(void *priv, struct sk_buff *skb, const struct nf_hook_state *nhs)
+ {
+-	struct sfe_l2_info l2_info;
+-	l2_info.parse_flags = 0;
++	struct sfe_l2_info l2_info = {0};
+ 
+ 	DEBUG_TRACE("%px: sfe: sfe_ipv4_local_out hook called.\n", skb);
+ 
+--- a/sfe_ipv6.c
++++ b/sfe_ipv6.c
+@@ -2329,10 +2329,12 @@ static unsigned int sfe_ipv6_local_out(v
+ 				struct sk_buff *skb,
+ 				const struct nf_hook_state *nhs)
+ {
++	struct sfe_l2_info l2_info = {0};
++
+ 	DEBUG_TRACE("sfe: sfe_ipv6_local_out hook called.\n");
+ 
+ 	if (likely(skb->skb_iif)) {
+-		return sfe_ipv6_recv(skb->dev, skb, NULL, true) ? NF_STOLEN : NF_ACCEPT;
++		return sfe_ipv6_recv(skb->dev, skb, &l2_info, true) ? NF_STOLEN : NF_ACCEPT;
+ 	}
+ 
+ 	return NF_ACCEPT;

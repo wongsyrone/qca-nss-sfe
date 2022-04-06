@@ -1,0 +1,1610 @@
+From bb7f17873854502c7afc6918ef0641f6bccd4243 Mon Sep 17 00:00:00 2001
+From: Wayne Tan <quic_wtan@quicinc.com>
+Date: Mon, 13 Dec 2021 11:16:04 -0800
+Subject: [PATCH] [qca-nss-sfe] 802.1Q/802.1ad VLAN support in SFE
+
+Change-Id: I8007484b229b0dac0aff6dc284641b94090539db
+Signed-off-by: Wayne Tan <quic_wtan@quicinc.com>
+---
+ sfe.c          |  75 +++++++++++------
+ sfe.h          |  13 ++-
+ sfe_ipv4.c     | 188 +++++++++++++++++++++++++++++++++++-------
+ sfe_ipv4.h     |  24 ++++++
+ sfe_ipv4_tcp.c |  47 +++++++----
+ sfe_ipv4_udp.c |  41 +++++++---
+ sfe_ipv6.c     | 154 +++++++++++++++++++++++++++++------
+ sfe_ipv6.h     |  25 ++++++
+ sfe_ipv6_tcp.c |  45 +++++++---
+ sfe_ipv6_udp.c |  40 ++++++---
+ sfe_pppoe.c    |  13 +--
+ sfe_pppoe.h    |  12 ++-
+ sfe_vlan.h     | 217 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 13 files changed, 755 insertions(+), 139 deletions(-)
+ create mode 100644 sfe_vlan.h
+
+--- a/sfe.c
++++ b/sfe.c
+@@ -31,6 +31,7 @@
+ #include "sfe_api.h"
+ #include "sfe.h"
+ #include "sfe_pppoe.h"
++#include "sfe_vlan.h"
+ 
+ extern int max_ipv4_conn;
+ extern int max_ipv6_conn;
+@@ -458,36 +459,51 @@ static bool sfe_recv_parse_l2(struct net
+ 	sfe_l2_hdr_offset_set(l2_info, ((skb->data - ETH_HLEN) - skb->head));
+ 
+ 	/*
+-	 * TODO: Add VLAN parsing here.
+-	 * Add VLAN fields to l2_info structure and update l2_hdr_size
+-	 * In case of exception, use l2_hdr_size to move the data pointer back
++	 * VLAN parsing
+ 	 */
+-
+-	/*
+-	 * PPPoE parsing
+-	 */
+-	if (unlikely(htons(ETH_P_PPP_SES) != skb->protocol)) {
++	if (unlikely(!sfe_vlan_check_and_parse_tag(skb, l2_info))) {
+ 		return false;
+ 	}
+ 
+ 	/*
+-	 * Parse only PPPoE session packets
+-	 * skb->data is pointing to PPPoE hdr
++	 * PPPoE parsing
+ 	 */
+-	if (!sfe_pppoe_parse_hdr(skb, l2_info)) {
++	if (htons(ETH_P_PPP_SES) == skb->protocol) {
++		/*
++		 * Parse only PPPoE session packets
++		 * skb->data is pointing to PPPoE hdr
++		 */
++		if (!sfe_pppoe_parse_hdr(skb, l2_info)) {
++
++			/*
++			 * For exception from PPPoE return from here without modifying the skb->data
++			 * This includes non-IPv4/v6 cases also
++			 */
++			return false;
++		}
+ 
+ 		/*
+-		 * For exception from PPPoE return from here without modifying the skb->data
+-		 * This includes non-IPv4/v6 cases also
++		 * Pull by L2 header size
+ 		 */
+-		return false;
++		__skb_pull(skb, sfe_l2_hdr_size_get(l2_info));
+ 	}
++	return true;
++}
+ 
++/*
++ * sfe_recv_undo_parse_l2()
++ */
++static void sfe_recv_undo_parse_l2(struct net_device *dev, struct sk_buff *skb, struct sfe_l2_info *l2_info)
++{
+ 	/*
+-	 * Pull by L2 header size considering all L2.5 headers
++	 * PPPoE undo
+ 	 */
+-	__skb_pull(skb, sfe_l2_hdr_size_get(l2_info));
+-	return true;
++	__skb_push(skb, sfe_l2_hdr_size_get(l2_info));
++
++	/*
++	 * VLAN undo
++	 */
++	sfe_vlan_undo_parse(skb, l2_info);
+ }
+ 
+ /*
+@@ -1144,6 +1160,8 @@ int sfe_recv(struct sk_buff *skb)
+ 	 * Setting parse flags to 0 since l2_info is passed for non L2.5 header case as well
+ 	 */
+ 	l2_info.parse_flags = 0;
++	l2_info.l2_hdr_size = 0;
++	l2_info.vlan_hdr_cnt = 0;
+ 
+ #ifdef CONFIG_NET_CLS_ACT
+ 	/*
+@@ -1171,7 +1189,7 @@ int sfe_recv(struct sk_buff *skb)
+ 			return sfe_ipv4_recv(dev, skb, &l2_info, false);
+ 		}
+ 
+-		DEBUG_TRACE("No IPv4 address for device: %s\n", dev->name);
++		DEBUG_TRACE("No IPv4 address for device: %s skb=%px\n", dev->name, skb);
+ 		return 0;
+ 
+ 	case ETH_P_IPV6:
+@@ -1179,7 +1197,7 @@ int sfe_recv(struct sk_buff *skb)
+ 			return sfe_ipv6_recv(dev, skb, &l2_info, false);
+ 		}
+ 
+-		DEBUG_TRACE("No IPv6 address for device: %s\n", dev->name);
++		DEBUG_TRACE("No IPv6 address for device: %s skb=%px\n", dev->name, skb);
+ 		return 0;
+ 
+ 	default:
+@@ -1190,7 +1208,8 @@ int sfe_recv(struct sk_buff *skb)
+ 	 * Stop L2 processing if L2 feature is disabled.
+ 	 */
+ 	if (!sfe_is_l2_feature_enabled()) {
+-		DEBUG_TRACE("Unsupported protocol %d (L2 feature is disabled)\n", ntohs(skb->protocol));
++		DEBUG_TRACE("Unsupported protocol %#x %s (L2 feature is disabled) skb=%px\n",
++				ntohs(skb->protocol), dev->name, skb);
+ 		return 0;
+ 	}
+ 
+@@ -1198,8 +1217,8 @@ int sfe_recv(struct sk_buff *skb)
+ 	 * Parse the L2 headers to find the L3 protocol and the L2 header offset
+ 	 */
+ 	if (unlikely(!sfe_recv_parse_l2(dev, skb, &l2_info))) {
+-		DEBUG_TRACE("%px: Invalid L2.5 header format with protocol : %d\n", skb, ntohs(skb->protocol));
+-		return 0;
++		DEBUG_TRACE("%px: Invalid L2.5 header format with protocol : %x\n", skb, ntohs(skb->protocol));
++		goto send_to_linux;
+ 	}
+ 
+ 	/*
+@@ -1216,18 +1235,24 @@ int sfe_recv(struct sk_buff *skb)
+ 
+ 	if (likely(l2_info.protocol == ETH_P_IPV6)) {
+ 		ret = sfe_ipv6_recv(dev, skb, &l2_info, false);
+-		if (likely(ret)) {
+-			return ret;
++		if (unlikely(!ret)) {
++			goto send_to_linux;
+ 		}
++		return ret;
+ 	}
+ 
++	DEBUG_TRACE("Non-IP(%x) %s skb=%px skb_vlan:%x/%x/%x skb_proto=%x\n",
++			l2_info.protocol, dev->name, skb,
++			ntohs(skb->vlan_proto), skb->vlan_tci, skb_vlan_tag_present(skb),
++		       	htons(skb->protocol));
++
+ send_to_linux:
+ 	/*
+ 	 * Push the data back before sending to linux if -
+ 	 * a. There is any exception from IPV4/V6
+ 	 * b. If the next protocol is neither IPV4 nor IPV6
+ 	 */
+-	__skb_push(skb, sfe_l2_hdr_size_get(&l2_info));
++	sfe_recv_undo_parse_l2(dev, skb, &l2_info);
+ 
+ 	return 0;
+ }
+--- a/sfe.h
++++ b/sfe.h
+@@ -53,6 +53,14 @@ typedef enum sfe_sync_reason {
+ } sfe_sync_reason_t;
+ 
+ /*
++ * VLAN header (aka VLAN tag)
++ */
++struct sfe_vlan_hdr {
++	u16 tpid;               /* Tag Protocol Identifier */
++	u16 tci;                /* Tag Control Information */
++};
++
++/*
+  * Structure used to store L2 information
+  */
+ struct sfe_l2_info {
+@@ -61,6 +69,9 @@ struct sfe_l2_info {
+ 	u16 l2_hdr_size;	/* L2 header size */
+ 	u16 pppoe_hdr_offset;	/* PPPOE header offset */
+ 	u16 protocol;		/* L3 Protocol */
++	struct sfe_vlan_hdr vlan_hdr[SFE_MAX_VLAN_DEPTH];
++				/* VLAN tag(s) of ingress packet */
++	u8 vlan_hdr_cnt;        /* Number of VLAN tags in the ingress packet */
+ };
+ 
+ /*
+@@ -96,7 +107,7 @@ struct sfe_connection_sync {
+ 	u64 dest_byte_count;
+ 	u32 dest_new_packet_count;
+ 	u32 dest_new_byte_count;
+-	u32 reason;		/* reason for stats sync message, i.e. destroy, flush, period sync */
++	u32 reason;                     /* reason for stats sync message, i.e. destroy, flush, period sync */
+ 	u64 delta_jiffies;		/* Time to be added to the current timeout to keep the connection alive */
+ };
+ 
+--- a/sfe_ipv4.c
++++ b/sfe_ipv4.c
+@@ -41,6 +41,7 @@
+ #include "sfe_ipv4_udp.h"
+ #include "sfe_ipv4_tcp.h"
+ #include "sfe_ipv4_icmp.h"
++#include "sfe_pppoe.h"
+ 
+ static char *sfe_ipv4_exception_events_string[SFE_IPV4_EXCEPTION_EVENT_LAST] = {
+ 	"UDP_HEADER_INCOMPLETE",
+@@ -890,6 +891,59 @@ sfe_ipv4_update_protocol_state(struct sf
+ 	}
+ }
+ 
++/*
++ * sfe_ipv4_match_entry_set_vlan()
++ */
++static void sfe_ipv4_match_entry_set_vlan(
++			struct sfe_ipv4_connection_match *cm,
++			u32 primary_ingress_vlan_tag,
++			u32 primary_egress_vlan_tag,
++			u32 secondary_ingress_vlan_tag,
++			u32 secondary_egress_vlan_tag)
++{
++	u16 tpid;
++	/*
++	 * Prevent stacking header counts when updating.
++	 */
++	cm->ingress_vlan_hdr_cnt = 0;
++	cm->egress_vlan_hdr_cnt = 0;
++	memset(cm->ingress_vlan_hdr, 0, sizeof(cm->ingress_vlan_hdr));
++	memset(cm->egress_vlan_hdr, 0, sizeof(cm->egress_vlan_hdr));
++
++	/*
++	 * vlan_hdr[0] corresponds to outer tag
++	 * vlan_hdr[1] corresponds to inner tag
++	 * Extract the vlan information (tpid and tci) from rule message
++	 */
++	if ((primary_ingress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(primary_ingress_vlan_tag >> 16);
++		cm->ingress_vlan_hdr[0].tpid = ntohs(tpid);
++		cm->ingress_vlan_hdr[0].tci = (u16)primary_ingress_vlan_tag;
++		cm->ingress_vlan_hdr_cnt++;
++	}
++
++	if ((secondary_ingress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(secondary_ingress_vlan_tag >> 16);
++		cm->ingress_vlan_hdr[1].tpid = ntohs(tpid);
++		cm->ingress_vlan_hdr[1].tci = (u16)secondary_ingress_vlan_tag;
++		cm->ingress_vlan_hdr_cnt++;
++	}
++
++	if ((primary_egress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(primary_egress_vlan_tag >> 16);
++		cm->egress_vlan_hdr[0].tpid = ntohs(tpid);
++		cm->egress_vlan_hdr[0].tci = (u16)primary_egress_vlan_tag;
++		cm->egress_vlan_hdr_cnt++;
++	}
++
++	if ((secondary_egress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(secondary_egress_vlan_tag >> 16);
++		cm->egress_vlan_hdr[1].tpid = ntohs(tpid);
++		cm->egress_vlan_hdr[1].tci = (u16)secondary_egress_vlan_tag;
++		cm->egress_vlan_hdr_cnt++;
++	}
++}
++
+ void sfe_ipv4_update_rule(struct sfe_ipv4_rule_create_msg *msg)
+ {
+ 	struct sfe_ipv4_connection *c;
+@@ -1026,11 +1080,11 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	 * trying to create.  If there is then we can't create a new one.
+ 	 */
+ 	c_old = sfe_ipv4_find_connection(si,
+-						  msg->tuple.protocol,
+-						  msg->tuple.flow_ip,
+-						  msg->tuple.flow_ident,
+-						  msg->tuple.return_ip,
+-						  msg->tuple.return_ident);
++					msg->tuple.protocol,
++					msg->tuple.flow_ip,
++					msg->tuple.flow_ident,
++					msg->tuple.return_ip,
++					msg->tuple.return_ident);
+ 
+ 	if (c_old != NULL) {
+ 		this_cpu_inc(si->stats_pcpu->connection_create_collisions64);
+@@ -1076,6 +1130,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	original_cm->xlate_src_port = msg->conn_rule.flow_ident_xlate;
+ 	original_cm->xlate_dest_ip = msg->conn_rule.return_ip_xlate;
+ 	original_cm->xlate_dest_port =msg->conn_rule.return_ident_xlate;
++
+ 	atomic_set(&original_cm->rx_packet_count, 0);
+ 	original_cm->rx_packet_count64 = 0;
+ 	atomic_set(&original_cm->rx_byte_count, 0);
+@@ -1086,13 +1141,14 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 
+ 	original_cm->connection = c;
+ 	original_cm->counter_match = reply_cm;
++	original_cm->l2_hdr_size = 0;
++	original_cm->flags = 0;
+ 
+ 	/*
+ 	 * UDP Socket is valid only in decap direction.
+ 	 */
+ 	RCU_INIT_POINTER(original_cm->up, NULL);
+ 
+-	original_cm->flags = 0;
+ 	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
+ 		original_cm->mark = msg->mark_rule.flow_mark;
+ 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
+@@ -1110,6 +1166,25 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW;
+ 	}
+ 
++	/*
++	 * Add VLAN rule to original_cm
++	 */
++	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) {
++		struct sfe_vlan_rule *vlan_primary_rule = &msg->vlan_primary_rule;
++		struct sfe_vlan_rule *vlan_secondary_rule = &msg->vlan_secondary_rule;
++		sfe_ipv4_match_entry_set_vlan(original_cm,
++					     vlan_primary_rule->ingress_vlan_tag,
++					     vlan_primary_rule->egress_vlan_tag,
++					     vlan_secondary_rule->ingress_vlan_tag,
++					     vlan_secondary_rule->egress_vlan_tag);
++
++		if ((msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE) &&
++			original_cm->egress_vlan_hdr_cnt > 0) {
++			original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG;
++			original_cm->l2_hdr_size += original_cm->egress_vlan_hdr_cnt * VLAN_HLEN;
++		}
++	}
++
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 	original_cm->flow_cookie = 0;
+ #endif
+@@ -1133,6 +1208,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		}
+ 	}
+ 
++	reply_cm->l2_hdr_size = 0;
+ 	reply_cm->flags = 0;
+ 
+ 	/*
+@@ -1153,12 +1229,14 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
+ 
+ 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
++		reply_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
+ 		reply_cm->pppoe_session_id = msg->pppoe_rule.flow_pppoe_session_id;
+ 		ether_addr_copy(reply_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
+ 	}
+ 
+ 	if (msg->valid_flags & SFE_RULE_CREATE_PPPOE_ENCAP_VALID) {
+ 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
++		original_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
+ 		original_cm->pppoe_session_id = msg->pppoe_rule.return_pppoe_session_id;
+ 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.return_pppoe_remote_mac);
+ 
+@@ -1191,6 +1269,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		ether_addr_copy((u8 *)original_cm->xmit_dest_mac, (u8 *)msg->conn_rule.return_mac);
+ 
+ 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR;
++		original_cm->l2_hdr_size += ETH_HLEN;
+ 
+ 		/*
+ 		 * If our dev writes Ethernet headers then we can write a really fast
+@@ -1247,6 +1326,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		reply_cm->priority = msg->qos_rule.return_qos_tag;
+ 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
+ 	}
++
+ 	if (msg->valid_flags & SFE_RULE_CREATE_DSCP_MARKING_VALID) {
+ 		reply_cm->dscp = msg->dscp_rule.return_dscp << SFE_IPV4_DSCP_SHIFT;
+ 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_DSCP_REMARK;
+@@ -1289,6 +1369,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ #else
+ 		if (!refcount_inc_not_zero(&sk->sk_refcnt)) {
+ #endif
++			spin_unlock_bh(&si->lock);
+ 			kfree(reply_cm);
+ 			kfree(original_cm);
+ 			kfree(c);
+@@ -1317,6 +1398,25 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 			ntohs(reply_cm->match_dest_port), ntohs(reply_cm->xlate_dest_port));
+ 	}
+ 
++	/*
++	 * Add VLAN rule to reply_cm
++	 */
++	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) {
++		struct sfe_vlan_rule *vlan_primary_rule = &msg->vlan_primary_rule;
++		struct sfe_vlan_rule *vlan_secondary_rule = &msg->vlan_secondary_rule;
++		sfe_ipv4_match_entry_set_vlan(reply_cm,
++					     vlan_primary_rule->egress_vlan_tag,
++					     vlan_primary_rule->ingress_vlan_tag,
++					     vlan_secondary_rule->egress_vlan_tag,
++					     vlan_secondary_rule->ingress_vlan_tag);
++
++		if ((msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE) &&
++			reply_cm->egress_vlan_hdr_cnt > 0) {
++			reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG;
++			reply_cm->l2_hdr_size += reply_cm->egress_vlan_hdr_cnt * VLAN_HLEN;
++		}
++	}
++
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 	reply_cm->flow_cookie = 0;
+ #endif
+@@ -1365,6 +1465,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		ether_addr_copy((u8 *)reply_cm->xmit_dest_mac, (u8 *)msg->conn_rule.flow_mac);
+ 
+ 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR;
++		reply_cm->l2_hdr_size += ETH_HLEN;
+ 
+ 		/*
+ 		 * If our dev writes Ethernet headers then we can write a really fast
+@@ -1389,23 +1490,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_XLATE_DEST;
+ 	}
+ 
+-	c->protocol = tuple->protocol;
+-	c->src_ip = tuple->flow_ip;
+-	c->src_ip_xlate =  msg->conn_rule.flow_ip_xlate;
+-	c->src_port = tuple->flow_ident;
+-	c->src_port_xlate = msg->conn_rule.flow_ident_xlate;
+-	c->original_dev = src_dev;
+-	c->original_match = original_cm;
+-	c->dest_ip = tuple->return_ip;
+-	c->dest_ip_xlate = msg->conn_rule.return_ip_xlate;
+-	c->dest_port = tuple->return_ident;
+-	c->dest_port_xlate = msg->conn_rule.return_ident_xlate;
+-	c->reply_dev = dest_dev;
+-	c->reply_match = reply_cm;
+-	c->debug_read_seq = 0;
+-	c->last_sync_jiffies = get_jiffies_64();
+-	c->removed = false;
+-
+ 	/*
+ 	 * Initialize the protocol-specific information that we track.
+ 	 */
+@@ -1428,6 +1512,26 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		break;
+ 	}
+ 
++	/*
++	 * Fill in the ipv4_connection object.
++	 */
++	c->protocol = tuple->protocol;
++	c->src_ip = tuple->flow_ip;
++	c->src_ip_xlate =  msg->conn_rule.flow_ip_xlate;
++	c->src_port = tuple->flow_ident;
++	c->src_port_xlate = msg->conn_rule.flow_ident_xlate;
++	c->original_dev = src_dev;
++	c->original_match = original_cm;
++	c->dest_ip = tuple->return_ip;
++	c->dest_ip_xlate = msg->conn_rule.return_ip_xlate;
++	c->dest_port = tuple->return_ident;
++	c->dest_port_xlate = msg->conn_rule.return_ident_xlate;
++	c->reply_dev = dest_dev;
++	c->reply_match = reply_cm;
++	c->debug_read_seq = 0;
++	c->last_sync_jiffies = get_jiffies_64();
++	c->removed = false;
++
+ 	sfe_ipv4_connection_match_compute_translations(original_cm);
+ 	sfe_ipv4_connection_match_compute_translations(reply_cm);
+ 	sfe_ipv4_insert_connection(si, c);
+@@ -1437,14 +1541,38 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	/*
+ 	 * We have everything we need!
+ 	 */
+-	DEBUG_INFO("new connection - p: %d\n"
+-		   "  s: %s:%pxM(%pxM):%pI4(%pI4):%u(%u)\n"
+-		   "  d: %s:%pxM(%pxM):%pI4(%pI4):%u(%u)\n",
++	DEBUG_INFO("NEW connection - p: %d\n"
++		   "original_cm: match_dev=src_dev: %s %d %pM\n"
++		   " xmit_dev=dest_dev: %s %d %pM\n"
++		   " xmit_src_mac: %pM\n"
++		   " xmit_dest_mac: %pM\n"
++		   " flags: %x l2_hdr: %u\n"
++		   "flow_ip: %pI4:%u\n"
++		   "flow_ip_xlate: %pI4:%u\n"
++		   "flow_mac: %pM\n"
++		   "reply_cm: match_dev=dest_dev: %s %d %pM\n"
++		   " xmit_dev=src_dev: %s %d %pM\n"
++		   " xmit_src_mac: %pM\n"
++		   " xmit_dest_mac: %pM\n"
++		   " flags: %x l2_hdr: %u\n"
++		   "return_ip: %pI4:%u\n"
++		   "return_ip_xlate: %pI4:%u\n"
++		   "return_mac: %pM\n"
++		   "flags: valid=%x src_mac_valid=%x\n",
+ 		   tuple->protocol,
+-		   src_dev->name, msg->conn_rule.flow_mac, NULL,
+-		   &tuple->flow_ip, &msg->conn_rule.flow_ip_xlate, ntohs(tuple->flow_ident), ntohs(msg->conn_rule.flow_ident_xlate),
+-		   dest_dev->name, NULL, msg->conn_rule.return_mac,
+-		   &tuple->return_ip, &msg->conn_rule.return_ip_xlate, ntohs(tuple->return_ident), ntohs(msg->conn_rule.return_ident_xlate));
++		   original_cm->match_dev->name, original_cm->match_dev->ifindex, original_cm->match_dev->dev_addr,
++		   original_cm->xmit_dev->name, original_cm->xmit_dev->ifindex, original_cm->xmit_dev->dev_addr,
++		   original_cm->xmit_src_mac, original_cm->xmit_dest_mac, original_cm->flags, original_cm->l2_hdr_size,
++		   &tuple->flow_ip, ntohs(tuple->flow_ident),
++		   &msg->conn_rule.flow_ip_xlate, ntohs(msg->conn_rule.flow_ident_xlate),
++		   msg->conn_rule.flow_mac,
++		   reply_cm->match_dev->name, reply_cm->match_dev->ifindex, reply_cm->match_dev->dev_addr,
++		   reply_cm->xmit_dev->name, reply_cm->xmit_dev->ifindex, reply_cm->xmit_dev->dev_addr,
++		   reply_cm->xmit_src_mac, reply_cm->xmit_dest_mac, reply_cm->flags, reply_cm->l2_hdr_size,
++		   &tuple->return_ip, ntohs(tuple->return_ident),
++		   &msg->conn_rule.return_ip_xlate, ntohs(msg->conn_rule.return_ident_xlate),
++		   msg->conn_rule.return_mac,
++		   msg->valid_flags, msg->src_mac_rule.mac_valid_flags);
+ 
+ 	return 0;
+ }
+--- a/sfe_ipv4.h
++++ b/sfe_ipv4.h
+@@ -18,6 +18,9 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#ifndef __SFE_IPV4_H
++#define __SFE_IPV4_H
++
+ #define SFE_IPV4_DSCP_MASK 0x3
+ #define SFE_IPV4_DSCP_SHIFT 2
+ 
+@@ -63,6 +66,9 @@ struct sfe_ipv4_tcp_connection_match {
+ 					/* Bridge flow */
+ #define SFE_IPV4_CONNECTION_MATCH_FLAG_MARK (1<<11)
+ 					/* skb mark of the packet */
++#define SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG (1<<12)
++					/* Insert VLAN tag */
++
+ /*
+  * IPv4 connection matching structure.
+  */
+@@ -104,6 +110,13 @@ struct sfe_ipv4_connection_match {
+ 	union {				/* Protocol-specific state */
+ 		struct sfe_ipv4_tcp_connection_match tcp;
+ 	} protocol_state;
++
++	/*
++	 * VLAN headers
++	 */
++	struct sfe_vlan_hdr ingress_vlan_hdr[SFE_MAX_VLAN_DEPTH];
++	struct sfe_vlan_hdr egress_vlan_hdr[SFE_MAX_VLAN_DEPTH];
++
+ 	/*
+ 	 * Stats recorded in a sync period. These stats will be added to
+ 	 * rx_packet_count64/rx_byte_count64 after a sync period.
+@@ -146,6 +159,9 @@ struct sfe_ipv4_connection_match {
+ 	u16 xmit_src_mac[ETH_ALEN / 2];
+ 					/* Source MAC address to use when forwarding */
+ 
++	u8 ingress_vlan_hdr_cnt;        /* Ingress active vlan headers count */
++	u8 egress_vlan_hdr_cnt;         /* Egress active vlan headers count */
++
+ 	/*
+ 	 * Summary stats.
+ 	 */
+@@ -157,6 +173,11 @@ struct sfe_ipv4_connection_match {
+ 	 */
+ 	u16 pppoe_session_id;
+ 	u8 pppoe_remote_mac[ETH_ALEN];
++
++	/*
++	 * Size of all needed L2 headers
++	 */
++	u16 l2_hdr_size;
+ };
+ 
+ /*
+@@ -243,6 +264,7 @@ enum sfe_ipv4_exception_events {
+ 	SFE_IPV4_EXCEPTION_EVENT_INVALID_PPPOE_SESSION,
+ 	SFE_IPV4_EXCEPTION_EVENT_INCORRECT_PPPOE_PARSING,
+ 	SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME,
++	SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH,
+ 	SFE_IPV4_EXCEPTION_EVENT_LAST
+ };
+ 
+@@ -360,3 +382,5 @@ sfe_ipv4_find_connection_match_rcu(struc
+ 
+ void sfe_ipv4_exit(void);
+ int sfe_ipv4_init(void);
++
++#endif /* __SFE_IPV4_H */
+--- a/sfe_ipv4_tcp.c
++++ b/sfe_ipv4_tcp.c
+@@ -29,6 +29,7 @@
+ #include "sfe_flow_cookie.h"
+ #include "sfe_ipv4.h"
+ #include "sfe_pppoe.h"
++#include "sfe_vlan.h"
+ 
+ /*
+  * sfe_ipv4_process_tcp_option_sack()
+@@ -132,7 +133,7 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	bool bridge_flow;
+ 
+ 	/*
+-	 * Is our packet too short to contain a valid UDP header?
++	 * Is our packet too short to contain a valid TCP header?
+ 	 */
+ 	if (unlikely(!pskb_may_pull(skb, (sizeof(struct tcphdr) + ihl)))) {
+ 		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_TCP_HEADER_INCOMPLETE);
+@@ -188,7 +189,7 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	}
+ 
+ 	/*
+-	 * If our packet has beern marked as "flush on find" we can't actually
++	 * If our packet has been marked as "flush on find" we can't actually
+ 	 * forward it in the fast path, but now that we've found an associated
+ 	 * connection we can flush that out before we process the packet.
+ 	 */
+@@ -222,6 +223,16 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	}
+ #endif
+ 
++	/*
++	 * Do we expect an ingress VLAN tag for this flow?
++	 */
++	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
++		rcu_read_unlock();
++		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
++		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
++		return 0;
++	}
++
+ 	bridge_flow = !!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW);
+ 
+ 	/*
+@@ -262,7 +273,7 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 		}
+ 
+ 		rcu_read_unlock();
+-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_UDP_IP_OPTIONS_OR_INITIAL_FRAGMENT);
++		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_TCP_IP_OPTIONS_OR_INITIAL_FRAGMENT);
+ 		return 0;
+ 	}
+ 
+@@ -525,6 +536,16 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	}
+ 
+ 	/*
++	 * Check if skb has enough headroom to write L2 headers
++	 */
++	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
++		rcu_read_unlock();
++		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
++		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
++		return 0;
++	}
++
++	/*
+ 	 * From this point on we're good to modify the packet.
+ 	 */
+ 
+@@ -532,20 +553,11 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+ 	if (cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
+-		if (unlikely(!sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IP))) {
+-			rcu_read_unlock();
+-			DEBUG_WARN("%px: PPPoE header addition failed\n", skb);
+-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
+-			return 0;
+-		}
++		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IP);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}
+ 
+ 	/*
+-	 * TODO : VLAN headers if any should be added here when supported.
+-	 */
+-
+-	/*
+ 	 * Update DSCP
+ 	 */
+ 	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_DSCP_REMARK)) {
+@@ -634,7 +646,14 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	skb->dev = xmit_dev;
+ 
+ 	/*
+-	 * Check to see if we need to write a header.
++	 * Check to see if we need to add VLAN tags
++	 */
++	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG)) {
++		sfe_vlan_add_tag(skb, cm->egress_vlan_hdr_cnt, cm->egress_vlan_hdr);
++	}
++
++	/*
++	 * Check to see if we need to write an Ethernet header.
+ 	 */
+ 	if (likely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR)) {
+ 		if (unlikely(!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_FAST_ETH_HDR))) {
+--- a/sfe_ipv4_udp.c
++++ b/sfe_ipv4_udp.c
+@@ -30,6 +30,7 @@
+ #include "sfe_flow_cookie.h"
+ #include "sfe_ipv4.h"
+ #include "sfe_pppoe.h"
++#include "sfe_vlan.h"
+ 
+ /*
+  * sfe_ipv4_udp_sk_deliver()
+@@ -215,6 +216,16 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	}
+ #endif
+ 
++	/*
++	 * Do we expect an ingress VLAN tag for this flow?
++	 */
++	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
++		rcu_read_unlock();
++		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
++		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
++		return 0;
++	}
++
+ 	bridge_flow = !!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW);
+ 
+ 	/*
+@@ -317,6 +328,16 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	}
+ 
+ 	/*
++	 * Check if skb has enough headroom to write L2 headers
++	 */
++	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
++		rcu_read_unlock();
++		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
++		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
++		return 0;
++	}
++
++	/*
+ 	 * From this point on we're good to modify the packet.
+ 	 */
+ 
+@@ -324,20 +345,11 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+ 	if (cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
+-		if (unlikely(!sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IP))) {
+-			rcu_read_unlock();
+-			DEBUG_WARN("%px: PPPoE header addition failed\n", skb);
+-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
+-			return 0;
+-		}
++		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IP);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}
+ 
+ 	/*
+-	 * TODO: VLAN header should be added here when they are supported.
+-	 */
+-
+-	/*
+ 	 * Enable HW csum if rx checksum is verified and xmit interface is CSUM offload capable.
+ 	 * Note: If L4 csum at Rx was found to be incorrect, we (router) should use incremental L4 checksum here
+ 	 * so that HW does not re-calculate/replace the L4 csum
+@@ -477,7 +489,14 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	skb->dev = xmit_dev;
+ 
+ 	/*
+-	 * Check to see if we need to write a header.
++	 * Check to see if we need to add VLAN tags
++	 */
++	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG)) {
++		sfe_vlan_add_tag(skb, cm->egress_vlan_hdr_cnt, cm->egress_vlan_hdr);
++	}
++
++	/*
++	 * Check to see if we need to write an Ethernet header.
+ 	 */
+ 	if (likely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR)) {
+ 		if (unlikely(!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_FAST_ETH_HDR))) {
+--- a/sfe_ipv6.c
++++ b/sfe_ipv6.c
+@@ -31,6 +31,7 @@
+ #include <linux/netfilter.h>
+ #include <linux/inetdevice.h>
+ #include <linux/netfilter_ipv6.h>
++
+ #include "sfe_debug.h"
+ #include "sfe_api.h"
+ #include "sfe.h"
+@@ -39,6 +40,7 @@
+ #include "sfe_ipv6_udp.h"
+ #include "sfe_ipv6_tcp.h"
+ #include "sfe_ipv6_icmp.h"
++#include "sfe_pppoe.h"
+ 
+ #define sfe_ipv6_addr_copy(src, dest) memcpy((void *)(dest), (void *)(src), 16)
+ 
+@@ -876,6 +878,59 @@ sfe_ipv6_update_protocol_state(struct sf
+ }
+ 
+ /*
++ * sfe_ipv6_match_entry_set_vlan()
++ */
++static void sfe_ipv6_match_entry_set_vlan(
++			struct sfe_ipv6_connection_match *cm,
++			u32 primary_ingress_vlan_tag,
++			u32 primary_egress_vlan_tag,
++			u32 secondary_ingress_vlan_tag,
++			u32 secondary_egress_vlan_tag)
++{
++	u16 tpid;
++	/*
++	 * Prevent stacking header counts when updating.
++	 */
++	cm->ingress_vlan_hdr_cnt = 0;
++	cm->egress_vlan_hdr_cnt = 0;
++	memset(cm->ingress_vlan_hdr, 0, sizeof(cm->ingress_vlan_hdr));
++	memset(cm->egress_vlan_hdr, 0, sizeof(cm->egress_vlan_hdr));
++
++	/*
++	 * vlan_hdr[0] corresponds to outer tag
++	 * vlan_hdr[1] corresponds to inner tag
++	 * Extract the vlan information (tpid and tci) from rule message
++	 */
++	if ((primary_ingress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(primary_ingress_vlan_tag >> 16);
++		cm->ingress_vlan_hdr[0].tpid = ntohs(tpid);
++		cm->ingress_vlan_hdr[0].tci = (u16)primary_ingress_vlan_tag;
++		cm->ingress_vlan_hdr_cnt++;
++	}
++
++	if ((secondary_ingress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(secondary_ingress_vlan_tag >> 16);
++		cm->ingress_vlan_hdr[1].tpid = ntohs(tpid);
++		cm->ingress_vlan_hdr[1].tci = (u16)secondary_ingress_vlan_tag;
++		cm->ingress_vlan_hdr_cnt++;
++	}
++
++	if ((primary_egress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(primary_egress_vlan_tag >> 16);
++		cm->egress_vlan_hdr[0].tpid = ntohs(tpid);
++		cm->egress_vlan_hdr[0].tci = (u16)primary_egress_vlan_tag;
++		cm->egress_vlan_hdr_cnt++;
++	}
++
++	if ((secondary_egress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
++		tpid = (u16)(secondary_egress_vlan_tag >> 16);
++		cm->egress_vlan_hdr[1].tpid = ntohs(tpid);
++		cm->egress_vlan_hdr[1].tci = (u16)secondary_egress_vlan_tag;
++		cm->egress_vlan_hdr_cnt++;
++	}
++}
++
++/*
+  * sfe_ipv6_update_rule()
+  *	update forwarding rule after rule is created.
+  */
+@@ -1016,8 +1071,12 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 	 * Check to see if there is already a flow that matches the rule we're
+ 	 * trying to create.  If there is then we can't create a new one.
+ 	 */
+-	old_c = sfe_ipv6_find_connection(si, tuple->protocol, (struct sfe_ipv6_addr *)tuple->flow_ip, tuple->flow_ident,
+-					 (struct sfe_ipv6_addr *)tuple->return_ip, tuple->return_ident);
++	old_c = sfe_ipv6_find_connection(si,
++					tuple->protocol,
++					(struct sfe_ipv6_addr *)tuple->flow_ip,
++					tuple->flow_ident,
++					(struct sfe_ipv6_addr *)tuple->return_ip,
++					tuple->return_ident);
+ 
+ 	if (old_c != NULL) {
+ 		this_cpu_inc(si->stats_pcpu->connection_create_collisions64);
+@@ -1072,13 +1131,14 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 
+ 	original_cm->connection = c;
+ 	original_cm->counter_match = reply_cm;
++	original_cm->l2_hdr_size = 0;
++	original_cm->flags = 0;
+ 
+ 	/*
+ 	 * Valid in decap direction only
+ 	 */
+ 	RCU_INIT_POINTER(original_cm->up, NULL);
+ 
+-	original_cm->flags = 0;
+ 	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
+ 		original_cm->mark =  msg->mark_rule.flow_mark;
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_MARK;
+@@ -1087,6 +1147,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		original_cm->priority = msg->qos_rule.flow_qos_tag;
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
+ 	}
++
+ 	if (msg->valid_flags & SFE_RULE_CREATE_DSCP_MARKING_VALID) {
+ 		original_cm->dscp = msg->dscp_rule.flow_dscp << SFE_IPV6_DSCP_SHIFT;
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_DSCP_REMARK;
+@@ -1095,6 +1156,25 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_FLOW;
+ 	}
+ 
++	/*
++	 * Add VLAN rule to original_cm
++	 */
++	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) {
++		struct sfe_vlan_rule *vlan_primary_rule = &msg->vlan_primary_rule;
++		struct sfe_vlan_rule *vlan_secondary_rule = &msg->vlan_secondary_rule;
++		sfe_ipv6_match_entry_set_vlan(original_cm,
++					     vlan_primary_rule->ingress_vlan_tag,
++					     vlan_primary_rule->egress_vlan_tag,
++					     vlan_secondary_rule->ingress_vlan_tag,
++					     vlan_secondary_rule->egress_vlan_tag);
++
++		if ((msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE) &&
++			original_cm->egress_vlan_hdr_cnt > 0) {
++			original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG;
++			original_cm->l2_hdr_size += original_cm->egress_vlan_hdr_cnt * VLAN_HLEN;
++		}
++	}
++
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 	original_cm->flow_cookie = 0;
+ #endif
+@@ -1118,6 +1198,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		}
+ 	}
+ 
++	reply_cm->l2_hdr_size = 0;
+ 	reply_cm->flags = 0;
+ 
+ 	/*
+@@ -1138,12 +1219,14 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
+ 
+ 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
++		reply_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
+ 		reply_cm->pppoe_session_id = msg->pppoe_rule.flow_pppoe_session_id;
+ 		ether_addr_copy(reply_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
+ 	}
+ 
+ 	if (msg->valid_flags & SFE_RULE_CREATE_PPPOE_ENCAP_VALID) {
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
++		original_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
+ 		original_cm->pppoe_session_id = msg->pppoe_rule.return_pppoe_session_id;
+ 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.return_pppoe_remote_mac);
+ 
+@@ -1175,6 +1258,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		ether_addr_copy((u8 *)original_cm->xmit_dest_mac, (u8 *)msg->conn_rule.return_mac);
+ 
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_L2_HDR;
++		original_cm->l2_hdr_size += ETH_HLEN;
+ 
+ 		/*
+ 		 * If our dev writes Ethernet headers then we can write a really fast
+@@ -1271,6 +1355,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ #else
+ 		if (!refcount_inc_not_zero(&sk->sk_refcnt)) {
+ #endif
++			spin_unlock_bh(&si->lock);
+ 			kfree(reply_cm);
+ 			kfree(original_cm);
+ 			kfree(c);
+@@ -1301,6 +1386,25 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 			ntohs(reply_cm->match_dest_port), ntohs(reply_cm->xlate_dest_port));
+ 	}
+ 
++	/*
++	 * Add VLAN rule to reply_cm
++	 */
++	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) {
++		struct sfe_vlan_rule *vlan_primary_rule = &msg->vlan_primary_rule;
++		struct sfe_vlan_rule *vlan_secondary_rule = &msg->vlan_secondary_rule;
++		sfe_ipv6_match_entry_set_vlan(reply_cm,
++					     vlan_primary_rule->egress_vlan_tag,
++					     vlan_primary_rule->ingress_vlan_tag,
++					     vlan_secondary_rule->egress_vlan_tag,
++					     vlan_secondary_rule->ingress_vlan_tag);
++
++		if ((msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE) &&
++			reply_cm->egress_vlan_hdr_cnt > 0) {
++			reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG;
++			reply_cm->l2_hdr_size += reply_cm->egress_vlan_hdr_cnt * VLAN_HLEN;
++		}
++	}
++
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 	reply_cm->flow_cookie = 0;
+ #endif
+@@ -1348,6 +1452,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		ether_addr_copy((u8 *)reply_cm->xmit_dest_mac, (u8 *)msg->conn_rule.flow_mac);
+ 
+ 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_L2_HDR;
++		reply_cm->l2_hdr_size += ETH_HLEN;
+ 
+ 		/*
+ 		 * If our dev writes Ethernet headers then we can write a really fast
+@@ -1364,25 +1469,6 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 	 * No support for NAT in ipv6
+ 	 */
+ 
+-	c->protocol = tuple->protocol;
+-	c->src_ip[0] = *(struct sfe_ipv6_addr *)tuple->flow_ip;
+-	c->src_ip_xlate[0] = *(struct sfe_ipv6_addr *)tuple->flow_ip;
+-	c->src_port = tuple->flow_ident;
+-	c->src_port_xlate = tuple->flow_ident;
+-	c->original_dev = src_dev;
+-	c->original_match = original_cm;
+-
+-	c->dest_ip[0] = *(struct sfe_ipv6_addr *)tuple->return_ip;
+-	c->dest_ip_xlate[0] = *(struct sfe_ipv6_addr *)tuple->return_ip;
+-	c->dest_port = tuple->return_ident;
+-	c->dest_port_xlate = tuple->return_ident;
+-
+-	c->reply_dev = dest_dev;
+-	c->reply_match = reply_cm;
+-	c->debug_read_seq = 0;
+-	c->last_sync_jiffies = get_jiffies_64();
+-	c->removed = false;
+-
+ 	/*
+ 	 * Initialize the protocol-specific information that we track.
+ 	 */
+@@ -1403,6 +1489,28 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		break;
+ 	}
+ 
++	/*
++	 * Fill in the ipv6_connection object.
++	 */
++	c->protocol = tuple->protocol;
++	c->src_ip[0] = *(struct sfe_ipv6_addr *)tuple->flow_ip;
++	c->src_ip_xlate[0] = *(struct sfe_ipv6_addr *)tuple->flow_ip;
++	c->src_port = tuple->flow_ident;
++	c->src_port_xlate = tuple->flow_ident;
++	c->original_dev = src_dev;
++	c->original_match = original_cm;
++
++	c->dest_ip[0] = *(struct sfe_ipv6_addr *)tuple->return_ip;
++	c->dest_ip_xlate[0] = *(struct sfe_ipv6_addr *)tuple->return_ip;
++	c->dest_port = tuple->return_ident;
++	c->dest_port_xlate = tuple->return_ident;
++
++	c->reply_dev = dest_dev;
++	c->reply_match = reply_cm;
++	c->debug_read_seq = 0;
++	c->last_sync_jiffies = get_jiffies_64();
++	c->removed = false;
++
+ 	sfe_ipv6_connection_match_compute_translations(original_cm);
+ 	sfe_ipv6_connection_match_compute_translations(reply_cm);
+ 	sfe_ipv6_insert_connection(si, c);
+@@ -2164,7 +2272,7 @@ static ssize_t sfe_ipv6_get_cpu(struct d
+ }
+ 
+ /*
+- * sfe_ipv4_set_cpu()
++ * sfe_ipv6_set_cpu()
+  */
+ static ssize_t sfe_ipv6_set_cpu(struct device *dev,
+ 					struct device_attribute *attr,
+--- a/sfe_ipv6.h
++++ b/sfe_ipv6.h
+@@ -18,6 +18,9 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#ifndef __SFE_IPV6_H
++#define __SFE_IPV6_H
++
+ #define CHAR_DEV_MSG_SIZE 768
+ 
+ #define SFE_IPV6_DSCP_MASK 0xf03f
+@@ -76,6 +79,9 @@ struct sfe_ipv6_tcp_connection_match {
+ 					/* Bridge flow */
+ #define SFE_IPV6_CONNECTION_MATCH_FLAG_MARK (1<<11)
+ 					/* set skb mark*/
++#define SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG (1<<12)
++					/* Insert VLAN tag */
++
+ /*
+  * IPv6 connection matching structure.
+  */
+@@ -115,6 +121,13 @@ struct sfe_ipv6_connection_match {
+ 	union {				/* Protocol-specific state */
+ 		struct sfe_ipv6_tcp_connection_match tcp;
+ 	} protocol_state;
++
++	/*
++	 * VLAN headers
++	 */
++	struct sfe_vlan_hdr ingress_vlan_hdr[SFE_MAX_VLAN_DEPTH];
++	struct sfe_vlan_hdr egress_vlan_hdr[SFE_MAX_VLAN_DEPTH];
++
+ 	/*
+ 	 * Stats recorded in a sync period. These stats will be added to
+ 	 * rx_packet_count64/rx_byte_count64 after a sync period.
+@@ -152,6 +165,9 @@ struct sfe_ipv6_connection_match {
+ 	u16 xmit_src_mac[ETH_ALEN / 2];
+ 					/* Source MAC address to use when forwarding */
+ 
++	u8 ingress_vlan_hdr_cnt;        /* Ingress active vlan headers count */
++	u8 egress_vlan_hdr_cnt;         /* Egress active vlan headers count */
++
+ 	/*
+ 	 * Summary stats.
+ 	 */
+@@ -163,6 +179,11 @@ struct sfe_ipv6_connection_match {
+ 	 */
+ 	u16 pppoe_session_id;
+ 	u8 pppoe_remote_mac[ETH_ALEN];
++
++	/*
++	 * Size of all needed L2 headers
++	 */
++	u16 l2_hdr_size;
+ };
+ 
+ /*
+@@ -248,6 +269,8 @@ enum sfe_ipv6_exception_events {
+ 	SFE_IPV6_EXCEPTION_EVENT_INVALID_PPPOE_SESSION,
+ 	SFE_IPV6_EXCEPTION_EVENT_INCORRECT_PPPOE_PARSING,
+ 	SFE_IPV6_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME,
++	SFE_IPV6_EXCEPTION_EVENT_NOT_ENOUGH_HEADROOM,
++	SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH,
+ 	SFE_IPV6_EXCEPTION_EVENT_LAST
+ };
+ 
+@@ -392,3 +415,5 @@ void sfe_ipv6_flush_connection(struct sf
+ 
+ void sfe_ipv6_exit(void);
+ int sfe_ipv6_init(void);
++
++#endif /* __SFE_IPV6_H */
+--- a/sfe_ipv6_tcp.c
++++ b/sfe_ipv6_tcp.c
+@@ -29,6 +29,7 @@
+ #include "sfe_flow_cookie.h"
+ #include "sfe_ipv6.h"
+ #include "sfe_pppoe.h"
++#include "sfe_vlan.h"
+ 
+ /*
+  * sfe_ipv6_process_tcp_option_sack()
+@@ -131,7 +132,7 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	bool bridge_flow;
+ 
+ 	/*
+-	 * Is our packet too short to contain a valid UDP header?
++	 * Is our packet too short to contain a valid TCP header?
+ 	 */
+ 	if (!pskb_may_pull(skb, (sizeof(struct tcphdr) + ihl))) {
+ 
+@@ -190,7 +191,7 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	}
+ 
+ 	/*
+-	 * If our packet has beern marked as "flush on find" we can't actually
++	 * If our packet has been marked as "flush on find" we can't actually
+ 	 * forward it in the fast path, but now that we've found an associated
+ 	 * connection we can flush that out before we process the packet.
+ 	 */
+@@ -222,6 +223,16 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	}
+ #endif
+ 
++	/*
++	 * Do we expect an ingress VLAN tag for this flow?
++	 */
++	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
++		rcu_read_unlock();
++		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
++		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
++		return 0;
++	}
++
+ 	bridge_flow = !!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_FLOW);
+ 
+ 	/*
+@@ -533,6 +544,16 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	}
+ 
+ 	/*
++	 * Check if skb has enough headroom to write L2 headers
++	 */
++	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
++		rcu_read_unlock();
++		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
++		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
++		return 0;
++	}
++
++	/*
+ 	 * From this point on we're good to modify the packet.
+ 	 */
+ 
+@@ -540,19 +561,11 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+ 	if (cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
+-		if (unlikely(!sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IPV6))) {
+-			rcu_read_unlock();
+-			DEBUG_WARN("%px: PPPoE header addition failed\n", skb);
+-			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
+-		}
++		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IPV6);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}
+ 
+ 	/*
+-	 * TODO: VLAN header should be added here when they are supported.
+-	 */
+-
+-	/*
+ 	 * Update DSCP
+ 	 */
+ 	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_DSCP_REMARK)) {
+@@ -635,8 +648,16 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	xmit_dev = cm->xmit_dev;
+ 	skb->dev = xmit_dev;
+ 
++
++	/*
++	 * Check to see if we need to add VLAN tags
++	 */
++	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG)) {
++		sfe_vlan_add_tag(skb, cm->egress_vlan_hdr_cnt, cm->egress_vlan_hdr);
++	}
++
+ 	/*
+-	 * Check to see if we need to write a header.
++	 * Check to see if we need to write an Ethernet header.
+ 	 */
+ 	if (likely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_L2_HDR)) {
+ 		if (unlikely(!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_FAST_ETH_HDR))) {
+--- a/sfe_ipv6_udp.c
++++ b/sfe_ipv6_udp.c
+@@ -30,6 +30,7 @@
+ #include "sfe_flow_cookie.h"
+ #include "sfe_ipv6.h"
+ #include "sfe_pppoe.h"
++#include "sfe_vlan.h"
+ 
+ /*
+  * sfe_ipv6_udp_sk_deliver()
+@@ -190,6 +191,16 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	}
+ 
+ 	/*
++	 * Do we expect an ingress VLAN tag for this flow?
++	 */
++	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
++		rcu_read_unlock();
++		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
++		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
++		return 0;
++	}
++
++	/*
+ 	 * If our packet has been marked as "flush on find" we can't actually
+ 	 * forward it in the fast path, but now that we've found an associated
+ 	 * connection we can flush that out before we process the packet.
+@@ -324,6 +335,16 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	}
+ 
+ 	/*
++	 * Check if skb has enough headroom to write L2 headers
++	 */
++	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
++		rcu_read_unlock();
++		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
++		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
++		return 0;
++	}
++
++	/*
+ 	 * From this point on we're good to modify the packet.
+ 	 */
+ 
+@@ -331,19 +352,11 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+ 	if (cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
+-		if (unlikely(!sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IPV6))) {
+-			rcu_read_unlock();
+-			DEBUG_WARN("%px: PPPoE header addition failed\n", skb);
+-			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
+-		}
++		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IPV6);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}
+ 
+ 	/*
+-	 * TODO: VLAN header should be added here when they are supported.
+-	 */
+-
+-	/*
+ 	 * UDP sock will be valid only in decap-path.
+ 	 * Call encap_rcv function associated with udp_sock in cm.
+ 	 */
+@@ -470,7 +483,14 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	skb->dev = xmit_dev;
+ 
+ 	/*
+-	 * Check to see if we need to write a header.
++	 * Check to see if we need to add VLAN tags
++	 */
++	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG)) {
++		sfe_vlan_add_tag(skb, cm->egress_vlan_hdr_cnt, cm->egress_vlan_hdr);
++	}
++
++	/*
++	 * Check to see if we need to write an Ethernet header.
+ 	 */
+ 	if (likely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_L2_HDR)) {
+ 		if (unlikely(!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_FAST_ETH_HDR))) {
+--- a/sfe_pppoe.c
++++ b/sfe_pppoe.c
+@@ -32,7 +32,7 @@
+  *
+  * skb->data will point to PPPoE header after the function
+  */
+-bool sfe_pppoe_add_header(struct sk_buff *skb, u16 pppoe_session_id, u16 ppp_protocol)
++void sfe_pppoe_add_header(struct sk_buff *skb, u16 pppoe_session_id, u16 ppp_protocol)
+ {
+ 	u16 *l2_header;
+ 	struct pppoe_hdr *ph;
+@@ -40,15 +40,6 @@ bool sfe_pppoe_add_header(struct sk_buff
+ 	u16 *l3_header = (u16 *)skb->data;
+ 
+ 	/*
+-	 * Check that we have space for PPPoE header, PPP header (2 bytes) and Ethernet header
+-	 * TODO: Calculate the l2_hdr_len during rule push so that this is avoided in datapath
+-	 */
+-	if (unlikely(skb_headroom(skb) < ((sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)) + ETH_HLEN))) {
+-		DEBUG_TRACE("%px: Not enough headroom for PPPoE header\n", skb);
+-		return false;
+-	}
+-
+-	/*
+ 	 * PPPoE header (6 bytes) + PPP header (2 bytes)
+ 	 *
+ 	 * Hence move by 8 bytes to accomodate PPPoE header
+@@ -80,8 +71,6 @@ bool sfe_pppoe_add_header(struct sk_buff
+ 	 * L2 header offset will point to PPPoE header,
+ 	 */
+ 	__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
+-
+-	return true;
+ }
+ 
+ /*
+--- a/sfe_pppoe.h
++++ b/sfe_pppoe.h
+@@ -17,6 +17,9 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#ifndef __SFE_PPPOE_H
++#define __SFE_PPPOE_H
++
+ #include <linux/ppp_defs.h>
+ #include <linux/if_pppox.h>
+ 
+@@ -24,5 +27,12 @@ struct sfe_ppp_hdr {
+ 	u16 protocol;
+ };
+ 
+-bool sfe_pppoe_add_header(struct sk_buff *skb, u16 pppoe_session_id, u16 ppp_protocol);
++/*
++ * PPPoE (6-byte) + PPP (2-byte) header.
++ */
++#define SFE_PPPOE_SESSION_HEADER_SIZE 8
++
++void sfe_pppoe_add_header(struct sk_buff *skb, u16 pppoe_session_id, u16 ppp_protocol);
+ bool sfe_pppoe_parse_hdr(struct sk_buff *skb, struct sfe_l2_info *l2_info);
++
++#endif /* __SFE_PPPOE_H */
+--- /dev/null
++++ b/sfe_vlan.h
+@@ -0,0 +1,217 @@
++/*
++ * sfe_vlan.h
++ *	Shortcut flow acceleration for 802.1AD/802.1Q flow
++ *
++ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef __SFE_VLAN_H
++#define __SFE_VLAN_H
++
++#include <linux/if_vlan.h>
++
++/*
++ * sfe_vlan_check_and_parse_tag()
++ *
++ * case 1: QinQ frame (e.g. outer tag = 88a80032, inner tag = 81000001):
++ * When entering this function:
++ * ----+-----------------+-----|-----+-----------+-----+---------
++ *     |DMAC    |SMAC    |88|a8|00|32|81|00|00|01|08|00|45|00|
++ * ----+-----------------+-----A-----+-----------+-----+---------
++ *                            skb->data
++ *   skb->protocol = ntohs(ETH_P_8021AD)
++ *   skb->vlan_proto = 0
++ *   skb->vlan_tci = 0
++ *   skb->vlan_present = 0
++ * When exiting:
++ * ----+-----------------+-----------+-----------+-----+---------
++ *     |DMAC    |SMAC    |88|a8|00|32|81|00|00|01|08|00|45|00|
++ * ----+-----------------+-----------+-----------+-----A---------
++ *                                                    skb->data
++ *   skb->protocol = ntohs(ETH_P_IP)
++ *   skb->vlan_proto = 0
++ *   skb->vlan_tci = 0
++ *   skb->vlan_present = 0
++ *   l2_info->vlan_hdr_cnt = 2
++ *   l2_info->vlan_hdr[0].tpid = ntohs(ETH_P_8021AD)
++ *   l2_info->vlan_hdr[0].tci = 0x0032
++ *   l2_info->vlan_hdr[1].tpid = ntohs(ETH_P_8021Q)
++ *   l2_info->vlan_hdr[1].tci = 0x0001
++ *   l2_info->protocol = ETH_P_IP
++ *
++ * case 2: 802.1Q frame (e.g. the tag is 81000001):
++ * When entering this function:
++ * ----+-----------------+-----|-----+-----+---------
++ *     |DMAC    |SMAC    |81|00|00|01|08|00|45|00|
++ * ----+-----------------+-----A-----+-----+---------
++ *                            skb->data
++ *   skb->protocol = ntohs(ETH_P_8021Q)
++ *   skb->vlan_proto = 0
++ *   skb->vlan_tci = 0
++ *   skb->vlan_present = 0
++ * When exiting:
++ * ----+-----------------+-----------+-----+---------
++ *     |DMAC    |SMAC    |81|00|00|01|08|00|45|00|
++ * ----+-----------------+-----------+-----A---------
++ *                                        skb->data
++ *   skb->protocol = ntohs(ETH_P_IP)
++ *   skb->vlan_proto = 0
++ *   skb->vlan_tci = 0
++ *   skb->vlan_present = 0
++ *   l2_info->vlan_hdr_cnt = 1
++ *   l2_info->vlan_hdr[0].tpid = ntohs(ETH_P_8021Q)
++ *   l2_info->vlan_hdr[0].tci = 0x0001
++ *   l2_info->protocol = ETH_P_IP
++ *
++ * case 3: untagged frame
++ * When entering this function:
++ * ----+-----------------+-----|---------------------
++ *     |DMAC    |SMAC    |08|00|45|00|
++ * ----+-----------------+-----A---------------------
++ *                            skb->data
++ *   skb->protocol = ntohs(ETH_P_IP)
++ *   skb->vlan_proto = 0
++ *   skb->vlan_tci = 0
++ *   skb->vlan_present = 0
++ * When exiting:
++ * ----+-----------------+-----|---------------------
++ *     |DMAC    |SMAC    |08|00|45|00|
++ * ----+-----------------+-----A---------------------
++ *                            skb->data
++ *   skb->protocol = ntohs(ETH_P_IP)
++ *   skb->vlan_proto = 0
++ *   skb->vlan_tci = 0
++ *   skb->vlan_present = 0
++ *   l2_info->vlan_hdr_cnt = 0
++ *   l2_info->protocol = ETH_P_IP
++ */
++static inline bool sfe_vlan_check_and_parse_tag(struct sk_buff *skb, struct sfe_l2_info *l2_info)
++{
++	struct vlan_hdr *vhdr;
++
++	l2_info->vlan_hdr_cnt = 0;
++
++	while ((skb->protocol == htons(ETH_P_8021AD) || skb->protocol == htons(ETH_P_8021Q)) &&
++			l2_info->vlan_hdr_cnt < SFE_MAX_VLAN_DEPTH) {
++		if (unlikely(!pskb_may_pull(skb, VLAN_HLEN))) {
++			return false;
++		}
++		vhdr = (struct vlan_hdr *)skb->data;
++		l2_info->vlan_hdr[l2_info->vlan_hdr_cnt].tpid = skb->protocol;
++		l2_info->vlan_hdr[l2_info->vlan_hdr_cnt].tci = ntohs(vhdr->h_vlan_TCI);
++		skb->protocol = vhdr->h_vlan_encapsulated_proto;
++		l2_info->vlan_hdr_cnt++;
++		__skb_pull(skb, VLAN_HLEN);
++	}
++
++	l2_info->protocol = htons(skb->protocol);
++	return true;
++}
++
++/*
++ * sfe_vlan_undo_parse()
++ *      Restore some skb fields which are modified when parsing VLAN tags.
++ */
++static inline void sfe_vlan_undo_parse(struct sk_buff *skb, struct sfe_l2_info *l2_info)
++{
++	if (l2_info->vlan_hdr_cnt == 0) {
++		return;
++	}
++
++	skb->protocol = l2_info->vlan_hdr[0].tpid;
++	__skb_push(skb, l2_info->vlan_hdr_cnt * VLAN_HLEN);
++}
++
++/*
++ * sfe_vlan_validate_ingress_tag()
++ *      Validate ingress packet's VLAN tag
++ */
++static inline bool sfe_vlan_validate_ingress_tag(
++		struct sk_buff *skb, u8 count, struct sfe_vlan_hdr *vlan_hdr, struct sfe_l2_info *l2_info)
++{
++	u8 i;
++
++	if (likely(!sfe_is_l2_feature_enabled())) {
++		return true;
++	}
++
++	if (unlikely(count != l2_info->vlan_hdr_cnt)) {
++		return false;
++	}
++
++	for (i = 0; i < count; i++) {
++		if (unlikely(vlan_hdr[i].tpid != l2_info->vlan_hdr[i].tpid)) {
++			return false;
++		}
++
++		if (unlikely((vlan_hdr[i].tci & VLAN_VID_MASK) !=
++			     (l2_info->vlan_hdr[i].tci & VLAN_VID_MASK))) {
++			return false;
++		}
++	}
++
++	return true;
++}
++
++/*
++ * sfe_vlan_add_tag()
++ *      Add VLAN tags at skb->data.
++ *      Normally, it is called just before adding 14-byte Ethernet header.
++ *
++ *      This function does not update skb->mac_header so later code
++ *      needs to call skb_reset_mac_header()/skb_reset_mac_len() to
++ *      get correct skb->mac_header/skb->mac_len.
++ *
++ *      It assumes:
++ *      - skb->protocol is set
++ *      - skb has enough headroom to write VLAN tags
++ *      - 0 < count <= SFE_MAX_VLAN_DEPTH
++ *
++ * When entering (e.g. skb->protocol = ntohs(ETH_P_IP) or ntohs(ETH_P_PPP_SES)):
++ *  -------------------------------+---------------------
++ *                                 |45|00|...
++ *  -------------------------------A---------------------
++ *                                skb->data
++ *  -------------------------------v-----------------+-----+----------
++ *                                 |11|00|xx|xx|xx|xx|00|21|45|00|...
++ *  -------------------------------+-----------------+-----+----------
++ *
++ * When exiting (e.g. to add outer/inner tag = 88a80032/81000001):
++ *  -------------+-----------+-----+---------------------
++ *         |00|32|81|00|00|01|08|00|45|00|05|d8|....
++ *  -------A-----+-----------+-----+---------------------
++ *        skb->data
++ *  -------v-----+-----------+-----+-----------------+-----+----------
++ *         |00|32|81|00|00|01|88|64|11|00|xx|xx|xx|xx|00|21|45|00|
++ *  -------------+-----------+-----+-----------------+-----+----------
++ *  skb->protocol = ntohs(ETH_P_8021AD)
++ */
++static inline void sfe_vlan_add_tag(struct sk_buff *skb, int count, struct sfe_vlan_hdr *vlan)
++{
++	struct vlan_hdr *vhdr;
++	int i;
++	vlan += (count - 1);
++
++	for (i = 0; i < count; i++) {
++		skb_push(skb, VLAN_HLEN);
++		vhdr = (struct vlan_hdr *)skb->data;
++		vhdr->h_vlan_TCI = htons(vlan->tci);
++		vhdr->h_vlan_encapsulated_proto = skb->protocol;
++		skb->protocol = vlan->tpid;
++		vlan--;
++	}
++}
++
++#endif /* __SFE_VLAN_H */

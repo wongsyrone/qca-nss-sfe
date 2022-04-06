@@ -1,0 +1,51 @@
+From 16ab38d2115d72245081ecd2e8c60a9e10b37fc7 Mon Sep 17 00:00:00 2001
+From: Nitin Shetty <quic_nitinsj@quicinc.com>
+Date: Wed, 9 Feb 2022 01:26:19 +0530
+Subject: [PATCH] [qca-nss-sfe] update PPPoE and VLAN error code strings
+
+Change-Id: I921ce4e456499eb26b69801ce410e8f8db8984ea
+Signed-off-by: Nitin Shetty <quic_nitinsj@quicinc.com>
+---
+ sfe_ipv4.c | 5 +++++
+ sfe_ipv6.c | 7 ++++++-
+ sfe_ipv6.h | 1 -
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+--- a/sfe_ipv4.c
++++ b/sfe_ipv4.c
+@@ -81,6 +81,11 @@ static char *sfe_ipv4_exception_events_s
+ 	"DATAGRAM_INCOMPLETE",
+ 	"IP_OPTIONS_INCOMPLETE",
+ 	"UNHANDLED_PROTOCOL",
++	"NO_HEADROOM",
++	"INVALID_PPPOE_SESSION",
++	"INCORRECT_PPPOE_PARSING",
++	"PPPOE_NOT_SET_IN_CME",
++	"INGRESS_VLAN_TAG_MISMATCH",
+ 	"INVALID_SOURCE_INTERFACE",
+ };
+ 
+--- a/sfe_ipv6.c
++++ b/sfe_ipv6.c
+@@ -82,6 +82,11 @@ static char *sfe_ipv6_exception_events_s
+ 	"IP_OPTIONS_INCOMPLETE",
+ 	"UNHANDLED_PROTOCOL",
+ 	"FLOW_COOKIE_ADD_FAIL",
++	"NO_HEADROOM",
++	"INVALID_PPPOE_SESSION",
++	"INCORRECT_PPPOE_PARSING",
++	"PPPOE_NOT_SET_IN_CME",
++	"INGRESS_VLAN_TAG_MISMATCH",
+ 	"INVALID_SOURCE_INTERFACE",
+ };
+ 
+--- a/sfe_ipv6.h
++++ b/sfe_ipv6.h
+@@ -271,7 +271,6 @@ enum sfe_ipv6_exception_events {
+ 	SFE_IPV6_EXCEPTION_EVENT_INVALID_PPPOE_SESSION,
+ 	SFE_IPV6_EXCEPTION_EVENT_INCORRECT_PPPOE_PARSING,
+ 	SFE_IPV6_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME,
+-	SFE_IPV6_EXCEPTION_EVENT_NOT_ENOUGH_HEADROOM,
+ 	SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH,
+ 	SFE_IPV6_EXCEPTION_EVENT_INVALID_SRC_IFACE,
+ 	SFE_IPV6_EXCEPTION_EVENT_LAST

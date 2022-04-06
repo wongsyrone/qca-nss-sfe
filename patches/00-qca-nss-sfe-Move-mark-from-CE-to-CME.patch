@@ -1,0 +1,498 @@
+From 37040ea92c120caef4cfc1a9a3c69196936208b8 Mon Sep 17 00:00:00 2001
+From: Ken Zhu <quic_guigenz@quicinc.com>
+Date: Thu, 9 Sep 2021 21:11:15 -0700
+Subject: [PATCH] [qca-nss-sfe] Move mark from CE to CME
+
+Move CE's field mark to CME structure and set the mark
+from create message
+
+Change-Id: I9ef717bd262bd4c506676b845926c094c13fea03
+Signed-off-by: Ken Zhu <quic_guigenz@quicinc.com>
+---
+ exports/sfe_api.h |  8 +++++++
+ sfe.h             |  6 -----
+ sfe_ipv4.c        | 56 +++++++++++++++++-----------------------------
+ sfe_ipv4.h        |  4 +++-
+ sfe_ipv4_tcp.c    |  5 ++---
+ sfe_ipv4_udp.c    |  5 ++---
+ sfe_ipv6.c        | 57 ++++++++++++++++-------------------------------
+ sfe_ipv6.h        |  5 +++--
+ sfe_ipv6_tcp.c    |  5 ++---
+ sfe_ipv6_udp.c    |  5 ++---
+ 10 files changed, 61 insertions(+), 95 deletions(-)
+
+--- a/exports/sfe_api.h
++++ b/exports/sfe_api.h
+@@ -58,6 +58,7 @@
+ #define SFE_RULE_CREATE_VLAN_MARKING_VALID (1<<7) /**< VLAN marking fields are valid */
+ #define SFE_RULE_CREATE_DIRECTION_VALID    (1<<8) /**< specify acceleration directions */
+ #define SFE_RULE_CREATE_SRC_MAC_VALID	   (1<<9) /**< Source MAC valid */
++#define SFE_RULE_CREATE_MARK_VALID         (1<<10) /**< SKB mark fields are valid */
+ 
+ /*
+  * Source MAC address valid flags (to be used with mac_valid_flags field of sfe_ipv4_src_mac_rule structure)
+@@ -210,6 +211,11 @@ struct sfe_qos_rule {
+ 	u32 return_qos_tag;	/**< QoS tag associated with this rule for return direction */
+ };
+ 
++struct sfe_mark_rule {
++	u32 flow_mark;		/**< skb mark associated with this rule for flow direction */
++	u32 return_mark;	/**< skb mark associated with this rule for return direction */
++};
++
+ /**
+  * DSCP connection rule structure
+  */
+@@ -252,6 +258,7 @@ struct sfe_ipv4_rule_create_msg {
+ 	struct sfe_pppoe_rule pppoe_rule;		/**< PPPoE related accleration parameters */
+ 	struct sfe_qos_rule qos_rule;			/**< QoS related accleration parameters */
+ 	struct sfe_src_mac_rule src_mac_rule;		/**< Src Mac rule */
++	struct sfe_mark_rule mark_rule;			/**< skb mark related accleration parameters */
+ 	struct sfe_dscp_rule dscp_rule;			/**< DSCP related accleration parameters */
+ 	struct sfe_vlan_rule vlan_primary_rule;		/**< Primary VLAN related accleration parameters */
+ 	struct sfe_vlan_rule vlan_secondary_rule;	/**< Secondary VLAN related accleration parameters */
+@@ -372,6 +379,7 @@ struct sfe_ipv6_rule_create_msg {
+ 	struct sfe_pppoe_rule pppoe_rule;		/**< PPPoE related accleration parameters */
+ 	struct sfe_qos_rule qos_rule;			/**< QoS related accleration parameters */
+ 	struct sfe_src_mac_rule src_mac_rule;		/**< Src Mac rule */
++	struct sfe_mark_rule mark_rule;			/**< skb mark related accleration parameters */
+ 	struct sfe_dscp_rule dscp_rule;			/**< DSCP related accleration parameters */
+ 	struct sfe_vlan_rule vlan_primary_rule;		/**< VLAN related accleration parameters */
+ 	struct sfe_vlan_rule vlan_secondary_rule;	/**< VLAN related accleration parameters */
+--- a/sfe.h
++++ b/sfe.h
+@@ -141,7 +141,6 @@ void sfe_ipv4_destroy_rule(struct sfe_ip
+ void sfe_ipv4_destroy_all_rules_for_dev(struct net_device *dev);
+ void sfe_ipv4_register_sync_rule_callback(sfe_sync_rule_callback_t callback);
+ void sfe_ipv4_update_rule(struct sfe_ipv4_rule_create_msg *msg);
+-void sfe_ipv4_mark_rule(struct sfe_connection_mark *mark);
+ 
+ #ifdef SFE_SUPPORT_IPV6
+ /*
+@@ -153,7 +152,6 @@ void sfe_ipv6_destroy_rule(struct sfe_ip
+ void sfe_ipv6_destroy_all_rules_for_dev(struct net_device *dev);
+ void sfe_ipv6_register_sync_rule_callback(sfe_sync_rule_callback_t callback);
+ void sfe_ipv6_update_rule(struct sfe_ipv6_rule_create_msg *msg);
+-void sfe_ipv6_mark_rule(struct sfe_connection_mark *mark);
+ #else
+ static inline int sfe_ipv6_recv(struct net_device *dev, struct sk_buff *skb, struct sfe_l2_info *l2_info, bool tun_outer)
+ {
+@@ -185,10 +183,6 @@ static inline void sfe_ipv6_update_rule(
+ 	return;
+ }
+ 
+-static inline void sfe_ipv6_mark_rule(struct sfe_connection_mark *mark)
+-{
+-	return;
+-}
+ #endif
+ 
+ /*
+--- a/sfe_ipv4.c
++++ b/sfe_ipv4.c
+@@ -444,34 +444,6 @@ static inline struct sfe_ipv4_connection
+ }
+ 
+ /*
+- * sfe_ipv4_mark_rule()
+- *	Updates the mark for a current offloaded connection
+- *
+- * Will take hash lock upon entry
+- */
+-void sfe_ipv4_mark_rule(struct sfe_connection_mark *mark)
+-{
+-	struct sfe_ipv4 *si = &__si;
+-	struct sfe_ipv4_connection *c;
+-
+-	spin_lock_bh(&si->lock);
+-	c = sfe_ipv4_find_connection(si, mark->protocol,
+-					      mark->src_ip.ip, mark->src_port,
+-					      mark->dest_ip.ip, mark->dest_port);
+-	if (c) {
+-		WARN_ON((0 != c->mark) && (0 == mark->mark));
+-		c->mark = mark->mark;
+-	}
+-	spin_unlock_bh(&si->lock);
+-
+-	if (c) {
+-		DEBUG_TRACE("Matching connection found for mark, "
+-			    "setting from %08x to %08x\n",
+-			    c->mark, mark->mark);
+-	}
+-}
+-
+-/*
+  * sfe_ipv4_insert_connection()
+  *	Insert a connection into the hash.
+  *
+@@ -1114,18 +1086,21 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 
+ 	original_cm->connection = c;
+ 	original_cm->counter_match = reply_cm;
+-	original_cm->flags = 0;
+ 
+ 	/*
+ 	 * UDP Socket is valid only in decap direction.
+ 	 */
+ 	RCU_INIT_POINTER(original_cm->up, NULL);
+ 
++	original_cm->flags = 0;
++	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
++		original_cm->mark = msg->mark_rule.flow_mark;
++		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
++	}
+ 	if (msg->valid_flags & SFE_RULE_CREATE_QOS_VALID) {
+ 		original_cm->priority =  msg->qos_rule.flow_qos_tag;
+ 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
+ 	}
+-
+ 	if (msg->valid_flags & SFE_RULE_CREATE_DSCP_MARKING_VALID) {
+ 		original_cm->dscp = msg->dscp_rule.flow_dscp << SFE_IPV4_DSCP_SHIFT;
+ 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_DSCP_REMARK;
+@@ -1262,6 +1237,12 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 
+ 	reply_cm->connection = c;
+ 	reply_cm->counter_match = original_cm;
++
++	reply_cm->flags = 0;
++	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
++		reply_cm->mark = msg->mark_rule.return_mark;
++		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
++	}
+ 	if (msg->valid_flags & SFE_RULE_CREATE_QOS_VALID) {
+ 		reply_cm->priority = msg->qos_rule.return_qos_tag;
+ 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
+@@ -1421,7 +1402,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	c->dest_port_xlate = msg->conn_rule.return_ident_xlate;
+ 	c->reply_dev = dest_dev;
+ 	c->reply_match = reply_cm;
+-	c->mark = 0;  /* TODO : no mark setting for create rule */
+ 	c->debug_read_seq = 0;
+ 	c->last_sync_jiffies = get_jiffies_64();
+ 	c->removed = false;
+@@ -1754,7 +1734,7 @@ static bool sfe_ipv4_debug_dev_read_conn
+ 	u64 dest_rx_packets;
+ 	u64 dest_rx_bytes;
+ 	u64 last_sync_jiffies;
+-	u32 mark, src_priority, dest_priority, src_dscp, dest_dscp;
++	u32 src_mark, dest_mark, src_priority, dest_priority, src_dscp, dest_dscp;
+ 	u32 packet, byte, original_cm_flags;
+ 	u16 pppoe_session_id;
+ 	u8 pppoe_remote_mac[ETH_ALEN];
+@@ -1797,6 +1777,7 @@ static bool sfe_ipv4_debug_dev_read_conn
+ 
+ 	src_rx_packets = original_cm->rx_packet_count64;
+ 	src_rx_bytes = original_cm->rx_byte_count64;
++	src_mark = original_cm->mark;
+ 	dest_dev = c->reply_dev;
+ 	dest_ip = c->dest_ip;
+ 	dest_ip_xlate = c->dest_ip_xlate;
+@@ -1806,8 +1787,8 @@ static bool sfe_ipv4_debug_dev_read_conn
+ 	dest_dscp = reply_cm->dscp >> SFE_IPV4_DSCP_SHIFT;
+ 	dest_rx_packets = reply_cm->rx_packet_count64;
+ 	dest_rx_bytes = reply_cm->rx_byte_count64;
++	dest_mark = reply_cm->mark;
+ 	last_sync_jiffies = get_jiffies_64() - c->last_sync_jiffies;
+-	mark = c->mark;
+ 	original_cm_flags = original_cm->flags;
+ 	pppoe_session_id = original_cm->pppoe_session_id;
+ 	ether_addr_copy(pppoe_remote_mac, original_cm->pppoe_remote_mac);
+@@ -1825,31 +1806,34 @@ static bool sfe_ipv4_debug_dev_read_conn
+ 				"src_port=\"%u\" src_port_xlate=\"%u\" "
+ 				"src_priority=\"%u\" src_dscp=\"%u\" "
+ 				"src_rx_pkts=\"%llu\" src_rx_bytes=\"%llu\" "
++				"src_mark=\"%08x\" "
+ 				"dest_dev=\"%s\" "
+ 				"dest_ip=\"%pI4\" dest_ip_xlate=\"%pI4\" "
+ 				"dest_port=\"%u\" dest_port_xlate=\"%u\" "
+ 				"dest_priority=\"%u\" dest_dscp=\"%u\" "
+ 				"dest_rx_pkts=\"%llu\" dest_rx_bytes=\"%llu\" "
++				"dest_mark=\"%08x\" "
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 				"src_flow_cookie=\"%d\" dst_flow_cookie=\"%d\" "
+ #endif
+-				"last_sync=\"%llu\" "
+-				"mark=\"%08x\"  ",
++				"last_sync=\"%llu\" ",
+ 				protocol,
+ 				src_dev->name,
+ 				&src_ip, &src_ip_xlate,
+ 				ntohs(src_port), ntohs(src_port_xlate),
+ 				src_priority, src_dscp,
+ 				src_rx_packets, src_rx_bytes,
++				src_mark,
+ 				dest_dev->name,
+ 				&dest_ip, &dest_ip_xlate,
+ 				ntohs(dest_port), ntohs(dest_port_xlate),
+ 				dest_priority, dest_dscp,
+ 				dest_rx_packets, dest_rx_bytes,
++				dest_mark,
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 				src_flow_cookie, dst_flow_cookie,
+ #endif
+-				last_sync_jiffies, mark);
++				last_sync_jiffies);
+ 
+ 	if (original_cm_flags &= (SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_DECAP | SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
+ 		bytes_read += snprintf(msg + bytes_read, CHAR_DEV_MSG_SIZE, "pppoe_session_id=\"%u\" pppoe_server MAC=\"%pM\" ",
+--- a/sfe_ipv4.h
++++ b/sfe_ipv4.h
+@@ -61,7 +61,8 @@ struct sfe_ipv4_tcp_connection_match {
+ 					/* Indicates that PPPoE should be encapsulated */
+ #define SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW (1<<10)
+ 					/* Bridge flow */
+-
++#define SFE_IPV4_CONNECTION_MATCH_FLAG_MARK (1<<11)
++					/* skb mark of the packet */
+ /*
+  * IPv4 connection matching structure.
+  */
+@@ -132,6 +133,7 @@ struct sfe_ipv4_connection_match {
+ 	 */
+ 	u32 priority;
+ 	u32 dscp;
++	u32 mark;			/* mark for outgoing packet */
+ 
+ 	/*
+ 	 * Packet transmit information.
+--- a/sfe_ipv4_tcp.c
++++ b/sfe_ipv4_tcp.c
+@@ -663,9 +663,8 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	/*
+ 	 * Mark outgoing packet
+ 	 */
+-	skb->mark = cm->connection->mark;
+-	if (skb->mark) {
+-		DEBUG_TRACE("SKB MARK is NON ZERO %x\n", skb->mark);
++	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_MARK)) {
++		skb->mark = cm->connection->mark;
+ 	}
+ 
+ 	rcu_read_unlock();
+--- a/sfe_ipv4_udp.c
++++ b/sfe_ipv4_udp.c
+@@ -504,9 +504,8 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	/*
+ 	 * Mark outgoing packet.
+ 	 */
+-	skb->mark = cm->connection->mark;
+-	if (skb->mark) {
+-		DEBUG_TRACE("%px: sfe: SKB MARK is NON ZERO %x\n", skb, skb->mark);
++	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_MARK)) {
++		skb->mark = cm->connection->mark;
+ 	}
+ 
+ 	rcu_read_unlock();
+--- a/sfe_ipv6.c
++++ b/sfe_ipv6.c
+@@ -444,34 +444,6 @@ static inline struct sfe_ipv6_connection
+ }
+ 
+ /*
+- * sfe_ipv6_mark_rule()
+- *	Updates the mark for a current offloaded connection
+- *
+- * Will take hash lock upon entry
+- */
+-void sfe_ipv6_mark_rule(struct sfe_connection_mark *mark)
+-{
+-	struct sfe_ipv6 *si = &__si6;
+-	struct sfe_ipv6_connection *c;
+-
+-	spin_lock_bh(&si->lock);
+-	c = sfe_ipv6_find_connection(si, mark->protocol,
+-				     mark->src_ip.ip6, mark->src_port,
+-				     mark->dest_ip.ip6, mark->dest_port);
+-	if (c) {
+-		WARN_ON((0 != c->mark) && (0 == mark->mark));
+-		c->mark = mark->mark;
+-	}
+-	spin_unlock_bh(&si->lock);
+-
+-	if (c) {
+-		DEBUG_TRACE("Matching connection found for mark, "
+-			    "setting from %08x to %08x\n",
+-			    c->mark, mark->mark);
+-	}
+-}
+-
+-/*
+  * sfe_ipv6_insert_connection()
+  *	Insert a connection into the hash.
+  *
+@@ -1100,13 +1072,17 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 
+ 	original_cm->connection = c;
+ 	original_cm->counter_match = reply_cm;
+-	original_cm->flags = 0;
+ 
+ 	/*
+ 	 * Valid in decap direction only
+ 	 */
+ 	RCU_INIT_POINTER(original_cm->up, NULL);
+ 
++	original_cm->flags = 0;
++	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
++		original_cm->mark =  msg->mark_rule.flow_mark;
++		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_MARK;
++	}
+ 	if (msg->valid_flags & SFE_RULE_CREATE_QOS_VALID) {
+ 		original_cm->priority = msg->qos_rule.flow_qos_tag;
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
+@@ -1115,7 +1091,6 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		original_cm->dscp = msg->dscp_rule.flow_dscp << SFE_IPV6_DSCP_SHIFT;
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_DSCP_REMARK;
+ 	}
+-
+ 	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_FLOW) {
+ 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_FLOW;
+ 	}
+@@ -1244,11 +1219,15 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 	reply_cm->connection = c;
+ 	reply_cm->counter_match = original_cm;
+ 
++	reply_cm->flags = 0;
++	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
++		reply_cm->mark =  msg->mark_rule.return_mark;
++		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_MARK;
++	}
+ 	if (msg->valid_flags & SFE_RULE_CREATE_QOS_VALID) {
+ 		reply_cm->priority = msg->qos_rule.return_qos_tag;
+ 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
+ 	}
+-
+ 	if (msg->valid_flags & SFE_RULE_CREATE_DSCP_MARKING_VALID) {
+ 		reply_cm->dscp = msg->dscp_rule.return_dscp << SFE_IPV6_DSCP_SHIFT;
+ 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_DSCP_REMARK;
+@@ -1400,7 +1379,6 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 
+ 	c->reply_dev = dest_dev;
+ 	c->reply_match = reply_cm;
+-	c->mark = 0; /* No mark support */
+ 	c->debug_read_seq = 0;
+ 	c->last_sync_jiffies = get_jiffies_64();
+ 	c->removed = false;
+@@ -1724,7 +1702,7 @@ static bool sfe_ipv6_debug_dev_read_conn
+ 	u64 dest_rx_packets;
+ 	u64 dest_rx_bytes;
+ 	u64 last_sync_jiffies;
+-	u32 mark, src_priority, dest_priority, src_dscp, dest_dscp;
++	u32 src_mark, dest_mark,  src_priority, dest_priority, src_dscp, dest_dscp;
+ 	u32 packet, byte, original_cm_flags;
+ 	u16 pppoe_session_id;
+ 	u8 pppoe_remote_mac[ETH_ALEN];
+@@ -1767,6 +1745,7 @@ static bool sfe_ipv6_debug_dev_read_conn
+ 
+ 	src_rx_packets = original_cm->rx_packet_count64;
+ 	src_rx_bytes = original_cm->rx_byte_count64;
++	src_mark = original_cm->mark;
+ 	dest_dev = c->reply_dev;
+ 	dest_ip = c->dest_ip[0];
+ 	dest_ip_xlate = c->dest_ip_xlate[0];
+@@ -1777,11 +1756,10 @@ static bool sfe_ipv6_debug_dev_read_conn
+ 	dest_rx_packets = reply_cm->rx_packet_count64;
+ 	dest_rx_bytes = reply_cm->rx_byte_count64;
+ 	last_sync_jiffies = get_jiffies_64() - c->last_sync_jiffies;
+-	mark = c->mark;
+ 	original_cm_flags = original_cm->flags;
+ 	pppoe_session_id = original_cm->pppoe_session_id;
+ 	ether_addr_copy(pppoe_remote_mac, original_cm->pppoe_remote_mac);
+-
++	dest_mark = reply_cm->mark;
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 	src_flow_cookie = original_cm->flow_cookie;
+ 	dst_flow_cookie = reply_cm->flow_cookie;
+@@ -1795,31 +1773,34 @@ static bool sfe_ipv6_debug_dev_read_conn
+ 				"src_port=\"%u\" src_port_xlate=\"%u\" "
+ 				"src_priority=\"%u\" src_dscp=\"%u\" "
+ 				"src_rx_pkts=\"%llu\" src_rx_bytes=\"%llu\" "
++				"src_mark=\"%08x\" "
+ 				"dest_dev=\"%s\" "
+ 				"dest_ip=\"%pI6\" dest_ip_xlate=\"%pI6\" "
+ 				"dest_port=\"%u\" dest_port_xlate=\"%u\" "
+ 				"dest_priority=\"%u\" dest_dscp=\"%u\" "
+ 				"dest_rx_pkts=\"%llu\" dest_rx_bytes=\"%llu\" "
++				"dest_mark=\"%08x\" "
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 				"src_flow_cookie=\"%d\" dst_flow_cookie=\"%d\" "
+ #endif
+-				"last_sync=\"%llu\" "
+-				"mark=\"%08x\"  ",
++				"last_sync=\"%llu\" ",
+ 				protocol,
+ 				src_dev->name,
+ 				&src_ip, &src_ip_xlate,
+ 				ntohs(src_port), ntohs(src_port_xlate),
+ 				src_priority, src_dscp,
+ 				src_rx_packets, src_rx_bytes,
++				src_mark,
+ 				dest_dev->name,
+ 				&dest_ip, &dest_ip_xlate,
+ 				ntohs(dest_port), ntohs(dest_port_xlate),
+ 				dest_priority, dest_dscp,
+ 				dest_rx_packets, dest_rx_bytes,
++				dest_mark,
+ #ifdef CONFIG_NF_FLOW_COOKIE
+ 				src_flow_cookie, dst_flow_cookie,
+ #endif
+-				last_sync_jiffies, mark);
++				last_sync_jiffies);
+ 
+ 	if (original_cm_flags &= (SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_DECAP | SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
+ 		bytes_read += snprintf(msg + bytes_read, CHAR_DEV_MSG_SIZE, "pppoe_session_id=\"%u\" pppoe_server_MAC=\"%pM\" ",
+--- a/sfe_ipv6.h
++++ b/sfe_ipv6.h
+@@ -74,7 +74,8 @@ struct sfe_ipv6_tcp_connection_match {
+ 					/* Indicates that PPPoE should be encapsulated */
+ #define SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_FLOW (1<<10)
+ 					/* Bridge flow */
+-
++#define SFE_IPV6_CONNECTION_MATCH_FLAG_MARK (1<<11)
++					/* set skb mark*/
+ /*
+  * IPv6 connection matching structure.
+  */
+@@ -132,6 +133,7 @@ struct sfe_ipv6_connection_match {
+ 	__be16 xlate_dest_port;	/* Port/connection ident after destination translation */
+ 	u16 xlate_dest_csum_adjustment;
+ 					/* Transport layer checksum adjustment after destination translation */
++	u32 mark;			/* mark for outgoing packet */
+ 
+ 	/*
+ 	 * QoS information
+@@ -194,7 +196,6 @@ struct sfe_ipv6_connection {
+ 					/* Pointer to the previous entry in the list of all connections */
+ 	bool removed;			/* Indicates the connection is removed */
+ 	struct rcu_head rcu;		/* delay rcu free */
+-	u32 mark;			/* mark for outgoing packet */
+ 	u32 debug_read_seq;		/* sequence number for debug dump */
+ };
+ 
+--- a/sfe_ipv6_tcp.c
++++ b/sfe_ipv6_tcp.c
+@@ -664,9 +664,8 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	/*
+ 	 * Mark outgoing packet
+ 	 */
+-	skb->mark = cm->connection->mark;
+-	if (skb->mark) {
+-		DEBUG_TRACE("SKB MARK is NON ZERO %x\n", skb->mark);
++	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_MARK)) {
++		skb->mark = cm->mark;
+ 	}
+ 
+ 	rcu_read_unlock();
+--- a/sfe_ipv6_udp.c
++++ b/sfe_ipv6_udp.c
+@@ -497,9 +497,8 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	/*
+ 	 * Mark outgoing packet.
+ 	 */
+-	skb->mark = cm->connection->mark;
+-	if (skb->mark) {
+-		DEBUG_TRACE("SKB MARK is NON ZERO %x\n", skb->mark);
++	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_MARK)) {
++		skb->mark = cm->mark;
+ 	}
+ 
+ 	rcu_read_unlock();

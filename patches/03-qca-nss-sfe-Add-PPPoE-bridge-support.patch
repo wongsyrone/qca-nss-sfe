@@ -1,0 +1,278 @@
+From 034d6353edb901ff0e8f88df592ad852eeb4b748 Mon Sep 17 00:00:00 2001
+From: Guduri Prathyusha <quic_gprathyu@quicinc.com>
+Date: Wed, 12 Jan 2022 16:49:04 +0530
+Subject: [PATCH] [qca-nss-sfe] Add PPPoE bridge support
+
+Change-Id: Ic55a3ec2bad9c5cf7b94964ab5a9ca9b3a9bc2ba
+Signed-off-by: Guduri Prathyusha <quic_gprathyu@quicinc.com>
+---
+ sfe_ipv4.c     |  8 +++++---
+ sfe_ipv4.h     |  5 +++--
+ sfe_ipv4_tcp.c | 21 +++++++++++++++------
+ sfe_ipv4_udp.c | 22 ++++++++++++++++------
+ sfe_ipv6.c     |  8 +++++---
+ sfe_ipv6.h     |  5 +++--
+ sfe_ipv6_tcp.c | 22 ++++++++++++++++------
+ sfe_ipv6_udp.c | 23 +++++++++++++++++------
+ 8 files changed, 80 insertions(+), 34 deletions(-)
+
+--- a/sfe_ipv4.c
++++ b/sfe_ipv4.c
+@@ -304,6 +304,7 @@ static void sfe_ipv4_update_summary_stat
+ 		stats->packets_not_forwarded64 += s->packets_not_forwarded64;
+ 		stats->pppoe_encap_packets_forwarded64 += s->pppoe_encap_packets_forwarded64;
+ 		stats->pppoe_decap_packets_forwarded64 += s->pppoe_decap_packets_forwarded64;
++		stats->pppoe_bridge_packets_forwarded64 += s->pppoe_bridge_packets_forwarded64;
+ 	}
+ 
+ }
+@@ -1317,7 +1318,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	reply_cm->connection = c;
+ 	reply_cm->counter_match = original_cm;
+ 
+-	reply_cm->flags = 0;
+ 	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
+ 		reply_cm->mark = msg->mark_rule.return_mark;
+ 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
+@@ -2109,7 +2109,8 @@ static bool sfe_ipv4_debug_dev_read_stat
+ 			      "flushes=\"%llu\" "
+ 			      "hash_hits=\"%llu\" hash_reorders=\"%llu\" "
+ 			      "pppoe_encap_pkts_fwded=\"%llu\" "
+-			      "pppoe_decap_pkts_fwded=\"%llu\" />\n",
++			      "pppoe_decap_pkts_fwded=\"%llu\" "
++			      "pppoe_bridge_pkts_fwded=\"%llu\" />\n",
+ 				num_conn,
+ 				stats.packets_dropped64,
+ 				stats.packets_forwarded64,
+@@ -2123,7 +2124,8 @@ static bool sfe_ipv4_debug_dev_read_stat
+ 				stats.connection_match_hash_hits64,
+ 				stats.connection_match_hash_reorders64,
+ 				stats.pppoe_encap_packets_forwarded64,
+-				stats.pppoe_decap_packets_forwarded64);
++				stats.pppoe_decap_packets_forwarded64,
++				stats.pppoe_bridge_packets_forwarded64);
+ 	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+ 		return false;
+ 	}
+--- a/sfe_ipv4.h
++++ b/sfe_ipv4.h
+@@ -295,8 +295,9 @@ struct sfe_ipv4_stats {
+ 	u64 packets_forwarded64;		/* Number of IPv4 packets forwarded */
+ 	u64 packets_not_forwarded64;	/* Number of IPv4 packets not forwarded */
+ 	u64 exception_events64[SFE_IPV4_EXCEPTION_EVENT_LAST];
+-	u64 pppoe_encap_packets_forwarded64;	/* Number of IPv4 PPPOE encap packets forwarded */
+-	u64 pppoe_decap_packets_forwarded64;	/* Number of IPv4 PPPOE decap packets forwarded */
++	u64 pppoe_encap_packets_forwarded64;	/* Number of IPv4 PPPoE encap packets forwarded */
++	u64 pppoe_decap_packets_forwarded64;	/* Number of IPv4 PPPoE decap packets forwarded */
++	u64 pppoe_bridge_packets_forwarded64;	/* Number of IPv4 PPPoE bridge packets forwarded */
+ };
+ 
+ /*
+--- a/sfe_ipv4_tcp.c
++++ b/sfe_ipv4_tcp.c
+@@ -527,12 +527,21 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	} else if (unlikely(sfe_l2_parse_flag_check(l2_info, SFE_L2_PARSE_FLAGS_PPPOE_INGRESS))) {
+ 
+ 		/*
+-		 * If packet contains PPPOE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
++		 * If packet contains PPPoE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
+ 		 */
+-		rcu_read_unlock();
+-		DEBUG_TRACE("%px: CME doesn't contain PPPOE flag but packet has PPPoE header\n", skb);
+-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
+-		return 0;
++		if (unlikely(!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW))) {
++			rcu_read_unlock();
++			DEBUG_TRACE("%px: CME doesn't contain PPPoE flag but packet has PPPoE header\n", skb);
++			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
++			return 0;
++		}
++
++		/*
++		 * For bridged flows when packet contains PPPoE header, restore the header back and forward to xmit interface
++		 */
++		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
++		l2_info->l2_hdr_size -= (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr));
++		this_cpu_inc(si->stats_pcpu->pppoe_bridge_packets_forwarded64);
+ 	}
+ 
+ 	/*
+@@ -552,7 +561,7 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	/*
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+-	if (cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
++	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
+ 		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IP);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}
+--- a/sfe_ipv4_udp.c
++++ b/sfe_ipv4_udp.c
+@@ -319,12 +319,22 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	} else if (unlikely(sfe_l2_parse_flag_check(l2_info, SFE_L2_PARSE_FLAGS_PPPOE_INGRESS))) {
+ 
+ 		/*
+-		 * If packet contains PPPOE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
++		 * If packet contains PPPoE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
+ 		 */
+-		rcu_read_unlock();
+-		DEBUG_TRACE("%px: CME doesn't contain PPPOE flag but packet has PPPoE header\n", skb);
+-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
+-		return 0;
++		if (unlikely(!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW))) {
++			rcu_read_unlock();
++			DEBUG_TRACE("%px: CME doesn't contain PPPoE flag but packet has PPPoE header\n", skb);
++			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
++			return 0;
++
++		}
++
++		/*
++		 * For bridged flows when packet contains PPPoE header, restore the header back and forward to xmit interface
++		 */
++		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
++		l2_info->l2_hdr_size -= (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr));
++		this_cpu_inc(si->stats_pcpu->pppoe_bridge_packets_forwarded64);
+ 	}
+ 
+ 	/*
+@@ -344,7 +354,7 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	/*
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+-	if (cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
++	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
+ 		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IP);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}
+--- a/sfe_ipv6.c
++++ b/sfe_ipv6.c
+@@ -304,6 +304,7 @@ static void sfe_ipv6_update_summary_stat
+ 		stats->packets_not_forwarded64 += s->packets_not_forwarded64;
+ 		stats->pppoe_encap_packets_forwarded64 += s->pppoe_encap_packets_forwarded64;
+ 		stats->pppoe_decap_packets_forwarded64 += s->pppoe_decap_packets_forwarded64;
++		stats->pppoe_bridge_packets_forwarded64 += s->pppoe_bridge_packets_forwarded64;
+ 	}
+ }
+ 
+@@ -1303,7 +1304,6 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 	reply_cm->connection = c;
+ 	reply_cm->counter_match = original_cm;
+ 
+-	reply_cm->flags = 0;
+ 	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
+ 		reply_cm->mark =  msg->mark_rule.return_mark;
+ 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_MARK;
+@@ -2057,7 +2057,8 @@ static bool sfe_ipv6_debug_dev_read_stat
+ 			      "flushes=\"%llu\" "
+ 			      "hash_hits=\"%llu\" hash_reorders=\"%llu\" "
+ 			      "pppoe_encap_pkts_fwded=\"%llu\" "
+-			      "pppoe_decap_pkts_fwded=\"%llu\" />\n",
++			      "pppoe_decap_pkts_fwded=\"%llu\" "
++			      "pppoe_bridge_pkts_fwded=\"%llu\" />\n",
+ 
+ 				num_conn,
+ 				stats.packets_dropped64,
+@@ -2072,7 +2073,8 @@ static bool sfe_ipv6_debug_dev_read_stat
+ 				stats.connection_match_hash_hits64,
+ 				stats.connection_match_hash_reorders64,
+ 				stats.pppoe_encap_packets_forwarded64,
+-				stats.pppoe_decap_packets_forwarded64);
++				stats.pppoe_decap_packets_forwarded64,
++				stats.pppoe_bridge_packets_forwarded64);
+ 	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+ 		return false;
+ 	}
+--- a/sfe_ipv6.h
++++ b/sfe_ipv6.h
+@@ -302,8 +302,9 @@ struct sfe_ipv6_stats {
+ 	u64 packets_forwarded64;		/* Number of IPv6 packets forwarded */
+ 	u64 packets_not_forwarded64;	/* Number of IPv6 packets not forwarded */
+ 	u64 exception_events64[SFE_IPV6_EXCEPTION_EVENT_LAST];
+-	u64 pppoe_encap_packets_forwarded64;	/* Number of IPv6 PPPOE encap packets forwarded */
+-	u64 pppoe_decap_packets_forwarded64;	/* Number of IPv6 PPPOE decap packets forwarded */
++	u64 pppoe_encap_packets_forwarded64;	/* Number of IPv6 PPPoE encap packets forwarded */
++	u64 pppoe_decap_packets_forwarded64;	/* Number of IPv6 PPPoE decap packets forwarded */
++	u64 pppoe_bridge_packets_forwarded64;	/* Number of IPv6 PPPoE decap packets forwarded */
+ };
+ 
+ /*
+--- a/sfe_ipv6_tcp.c
++++ b/sfe_ipv6_tcp.c
+@@ -535,12 +535,22 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	} else if (unlikely(sfe_l2_parse_flag_check(l2_info, SFE_L2_PARSE_FLAGS_PPPOE_INGRESS))) {
+ 
+ 		/*
+-		 * If packet contains PPPOE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
++		 * If packet contains PPPoE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
+ 		 */
+-		rcu_read_unlock();
+-		DEBUG_TRACE("%px: CME doesn't contain PPPOE flag but packet has PPPoE header\n", skb);
+-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
+-		return 0;
++		if (unlikely(!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_FLOW))) {
++			rcu_read_unlock();
++			DEBUG_TRACE("%px: CME doesn't contain PPPoE flag but packet has PPPoE header\n", skb);
++			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
++			return 0;
++
++		}
++
++		/*
++		 * For bridged flows when packet contains PPPoE header, restore the header back and forward to xmit interface
++		 */
++		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
++		l2_info->l2_hdr_size -= (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr));
++		this_cpu_inc(si->stats_pcpu->pppoe_bridge_packets_forwarded64);
+ 	}
+ 
+ 	/*
+@@ -560,7 +570,7 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	/*
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+-	if (cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
++	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
+ 		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IPV6);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}
+--- a/sfe_ipv6_udp.c
++++ b/sfe_ipv6_udp.c
+@@ -326,12 +326,23 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	} else if (unlikely(sfe_l2_parse_flag_check(l2_info, SFE_L2_PARSE_FLAGS_PPPOE_INGRESS))) {
+ 
+ 		/*
+-		 * If packet contains PPPOE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
++		 * If packet contains PPPoE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
+ 		 */
+-		rcu_read_unlock();
+-		DEBUG_TRACE("%px: PPPoE is not parsed\n", skb);
+-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INCORRECT_PPPOE_PARSING);
+-		return 0;
++
++		if (unlikely(!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_FLOW))) {
++			rcu_read_unlock();
++			DEBUG_TRACE("%px: CME doesn't contain PPPoE flag but packet has PPPoE header\n", skb);
++			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INCORRECT_PPPOE_PARSING);
++			return 0;
++		}
++
++		/*
++		 * For bridged flows when packet contains PPPoE header, restore the header back and forward to xmit interface
++		 */
++		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
++		l2_info->l2_hdr_size -= (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr));
++		this_cpu_inc(si->stats_pcpu->pppoe_bridge_packets_forwarded64);
++
+ 	}
+ 
+ 	/*
+@@ -351,7 +362,7 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	/*
+ 	 * For PPPoE flows, add PPPoE header before L2 header is added.
+ 	 */
+-	if (cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
++	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
+ 		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IPV6);
+ 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
+ 	}

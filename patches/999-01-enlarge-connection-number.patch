@@ -1,0 +1,13 @@
+--- a/sfe.h
++++ b/sfe.h
+@@ -32,6 +32,10 @@
+ #define SFE_MAX_CONNECTION_NUM 4096
+ #endif
+ 
++/* wongsyrone: enlarge max conn num  */
++#undef SFE_MAX_CONNECTION_NUM
++#define SFE_MAX_CONNECTION_NUM 32768
++
+ #define SFE_L2_PARSE_FLAGS_PPPOE_INGRESS 0x01	/* Indicates presence of a valid PPPoE header */
+ 
+ /*

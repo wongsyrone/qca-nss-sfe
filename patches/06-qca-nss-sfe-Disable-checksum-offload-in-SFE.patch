@@ -1,0 +1,69 @@
+From 4844553579947f814389287c791556cbff90d4bb Mon Sep 17 00:00:00 2001
+From: Ratheesh Kannoth <quic_rkannoth@quicinc.com>
+Date: Mon, 7 Feb 2022 16:19:00 +0530
+Subject: [PATCH] [qca-nss-sfe] Disable checksum offload in SFE
+
+Change-Id: Ib100d1c2565e4421a1625867c90e30d024912d60
+Signed-off-by: Ratheesh Kannoth <quic_rkannoth@quicinc.com>
+---
+ sfe_ipv4.c | 11 +++++++++++
+ sfe_ipv6.c | 10 ++++++++++
+ 2 files changed, 21 insertions(+)
+
+--- a/sfe_ipv4.c
++++ b/sfe_ipv4.c
+@@ -1204,7 +1204,13 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	if (likely(dest_dev->features & NETIF_F_HW_CSUM) && !netif_is_vxlan(dest_dev)) {
+ 		if ((msg->conn_rule.return_top_interface_num == msg->conn_rule.return_interface_num) ||
+ 			(msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE)) {
++
++			/*
++			 * Dont enable CSUM offload
++			 */
++#if 0
+ 			original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
++#endif
+ 		}
+ 	}
+ 
+@@ -1444,7 +1450,12 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	if (likely(src_dev->features & NETIF_F_HW_CSUM) && !(netif_is_vxlan(src_dev) || netif_is_vxlan(dest_dev))) {
+ 		if ((msg->conn_rule.flow_top_interface_num == msg->conn_rule.flow_interface_num) ||
+ 			(msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE)) {
++			/*
++			 * Dont enable CSUM offload
++			 */
++#if 0
+ 			 reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
++#endif
+ 		}
+ 	}
+ 
+--- a/sfe_ipv6.c
++++ b/sfe_ipv6.c
+@@ -1195,7 +1195,12 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 	if (likely(dest_dev->features & NETIF_F_HW_CSUM) && !netif_is_vxlan(dest_dev)) {
+ 		if ((msg->conn_rule.return_top_interface_num == msg->conn_rule.return_interface_num) ||
+ 			(msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE)) {
++			/*
++			 * Dont enable CSUM offload
++			 */
++#if 0
+ 			 original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
++#endif
+ 		}
+ 	}
+ 
+@@ -1428,7 +1433,12 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 	if (likely(src_dev->features & NETIF_F_HW_CSUM) && !(netif_is_vxlan(src_dev) || netif_is_vxlan(dest_dev))) {
+ 		if ((msg->conn_rule.flow_top_interface_num == msg->conn_rule.flow_interface_num) ||
+ 			(msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE)) {
++			/*
++			 * Dont enable CSUM offload
++			 */
++#if 0
+ 			 reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
++#endif
+ 		}
+ 	}
+ 

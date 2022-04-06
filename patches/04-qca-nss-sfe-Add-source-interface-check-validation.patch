@@ -1,0 +1,285 @@
+From 5dee3779839c88820264f6521717b4047e53b256 Mon Sep 17 00:00:00 2001
+From: Ratheesh Kannoth <quic_rkannoth@quicinc.com>
+Date: Tue, 18 Jan 2022 11:27:14 +0530
+Subject: [PATCH] [qca-nss-sfe] Add source interface check validation
+
+Change-Id: Ic2bbe856505c17c2d5c3c01edc21fda9bfba2e5c
+Signed-off-by: Ratheesh Kannoth <quic_rkannoth@quicinc.com>
+---
+ exports/sfe_api.h |  1 +
+ sfe_ipv4.c        | 17 ++++++++++++-----
+ sfe_ipv4.h        |  3 +++
+ sfe_ipv4_tcp.c    | 20 +++++++++++++++++++-
+ sfe_ipv4_udp.c    | 21 ++++++++++++++++++++-
+ sfe_ipv6.c        | 14 +++++++++++---
+ sfe_ipv6.h        |  3 +++
+ sfe_ipv6_tcp.c    | 21 +++++++++++++++++++--
+ sfe_ipv6_udp.c    | 18 ++++++++++++++++++
+ 9 files changed, 106 insertions(+), 12 deletions(-)
+
+--- a/exports/sfe_api.h
++++ b/exports/sfe_api.h
+@@ -44,6 +44,7 @@
+ #define SFE_RULE_CREATE_FLAG_L2_ENCAP     (1<<7) /**< consists of an encapsulating protocol that carries an IPv4 payload within it. */
+ #define SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE (1<<8) /**< Use flow interface number instead of top interface. */
+ #define SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE (1<<9) /**< Use return interface number instead of top interface. */
++#define SFE_RULE_CREATE_FLAG_SRC_INTERFACE_CHECK  (1<<10)  /**< Check source interface. */
+ 
+ /**
+  * Rule creation validity flags.
+--- a/sfe_ipv4.c
++++ b/sfe_ipv4.c
+@@ -80,7 +80,8 @@ static char *sfe_ipv4_exception_events_s
+ 	"NON_INITIAL_FRAGMENT",
+ 	"DATAGRAM_INCOMPLETE",
+ 	"IP_OPTIONS_INCOMPLETE",
+-	"UNHANDLED_PROTOCOL"
++	"UNHANDLED_PROTOCOL",
++	"INVALID_SOURCE_INTERFACE",
+ };
+ 
+ static struct sfe_ipv4 __si;
+@@ -120,8 +121,7 @@ static inline unsigned int sfe_ipv4_get_
+ 							      __be32 src_ip, __be16 src_port,
+ 							      __be32 dest_ip, __be16 dest_port)
+ {
+-	size_t dev_addr = (size_t)dev;
+-	u32 hash = ((u32)dev_addr) ^ ntohl(src_ip ^ dest_ip) ^ protocol ^ ntohs(src_port ^ dest_port);
++	u32 hash =  ntohl(src_ip ^ dest_ip) ^ protocol ^ ntohs(src_port ^ dest_port);
+ 	return ((hash >> SFE_IPV4_CONNECTION_HASH_SHIFT) ^ hash) & SFE_IPV4_CONNECTION_HASH_MASK;
+ }
+ 
+@@ -151,8 +151,7 @@ sfe_ipv4_find_connection_match_rcu(struc
+ 			   || cm->match_dest_port != dest_port
+ 			   || cm->match_src_ip != src_ip
+ 			   || cm->match_dest_ip != dest_ip
+-			   || cm->match_protocol != protocol
+-			   || cm->match_dev != dev) {
++			   || cm->match_protocol != protocol) {
+ 			continue;
+ 		}
+ 
+@@ -1210,6 +1209,10 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 	}
+ 
+ 	reply_cm->l2_hdr_size = 0;
++	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_SRC_INTERFACE_CHECK) {
++		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK;
++	}
++
+ 	reply_cm->flags = 0;
+ 
+ 	/*
+@@ -1246,6 +1249,10 @@ int sfe_ipv4_create_rule(struct sfe_ipv4
+ 		ether_addr_copy(reply_cm->pppoe_remote_mac, msg->pppoe_rule.return_pppoe_remote_mac);
+ 	}
+ 
++	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_SRC_INTERFACE_CHECK) {
++		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK;
++	}
++
+ 	/*
+ 	 * For the non-arp interface, we don't write L2 HDR.
+ 	 */
+--- a/sfe_ipv4.h
++++ b/sfe_ipv4.h
+@@ -68,6 +68,8 @@ struct sfe_ipv4_tcp_connection_match {
+ 					/* skb mark of the packet */
+ #define SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG (1<<12)
+ 					/* Insert VLAN tag */
++#define SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK (1<<13)
++					/* Source interface check.*/
+ 
+ /*
+  * IPv4 connection matching structure.
+@@ -265,6 +267,7 @@ enum sfe_ipv4_exception_events {
+ 	SFE_IPV4_EXCEPTION_EVENT_INCORRECT_PPPOE_PARSING,
+ 	SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME,
+ 	SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH,
++	SFE_IPV4_EXCEPTION_EVENT_INVALID_SRC_IFACE,
+ 	SFE_IPV4_EXCEPTION_EVENT_LAST
+ };
+ 
+--- a/sfe_ipv4_tcp.c
++++ b/sfe_ipv4_tcp.c
+@@ -189,6 +189,24 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *s
+ 	}
+ 
+ 	/*
++	 * Source interface validate.
++	 */
++	if (unlikely((cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK) && (cm->match_dev != dev))) {
++		struct sfe_ipv4_connection *c = cm->connection;
++		spin_lock_bh(&si->lock);
++		ret = sfe_ipv4_remove_connection(si, c);
++		spin_unlock_bh(&si->lock);
++
++		if (ret) {
++			sfe_ipv4_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
++		}
++		rcu_read_unlock();
++		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INVALID_SRC_IFACE);
++		DEBUG_TRACE("flush on wrong source interface check failure\n");
++		return 0;
++	}
++
++	/*
+ 	 * If our packet has been marked as "flush on find" we can't actually
+ 	 * forward it in the fast path, but now that we've found an associated
+ 	 * connection we can flush that out before we process the packet.
+--- a/sfe_ipv4_udp.c
++++ b/sfe_ipv4_udp.c
+@@ -185,6 +185,24 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *s
+ 	}
+ 
+ 	/*
++	 * Source interface validate.
++	 */
++	if (unlikely((cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK) && (cm->match_dev != dev))) {
++		struct sfe_ipv4_connection *c = cm->connection;
++		spin_lock_bh(&si->lock);
++		ret = sfe_ipv4_remove_connection(si, c);
++		spin_unlock_bh(&si->lock);
++
++		if (ret) {
++			sfe_ipv4_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
++		}
++		rcu_read_unlock();
++		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INVALID_SRC_IFACE);
++		DEBUG_TRACE("flush on wrong source interface check failure\n");
++		return 0;
++	}
++
++	/*
+ 	 * If our packet has beern marked as "flush on find" we can't actually
+ 	 * forward it in the fast path, but now that we've found an associated
+ 	 * connection we can flush that out before we process the packet.
+--- a/sfe_ipv6.c
++++ b/sfe_ipv6.c
+@@ -81,7 +81,8 @@ static char *sfe_ipv6_exception_events_s
+ 	"DATAGRAM_INCOMPLETE",
+ 	"IP_OPTIONS_INCOMPLETE",
+ 	"UNHANDLED_PROTOCOL",
+-	"FLOW_COOKIE_ADD_FAIL"
++	"FLOW_COOKIE_ADD_FAIL",
++	"INVALID_SOURCE_INTERFACE",
+ };
+ 
+ static struct sfe_ipv6 __si6;
+@@ -106,12 +107,11 @@ static inline unsigned int sfe_ipv6_get_
+ 							      struct sfe_ipv6_addr *dest_ip, __be16 dest_port)
+ {
+ 	u32 idx, hash = 0;
+-	size_t dev_addr = (size_t)dev;
+ 
+ 	for (idx = 0; idx < 4; idx++) {
+ 		hash ^= src_ip->addr[idx] ^ dest_ip->addr[idx];
+ 	}
+-	hash = ((u32)dev_addr) ^ hash ^ protocol ^ ntohs(src_port ^ dest_port);
++	hash =  hash ^ protocol ^ ntohs(src_port ^ dest_port);
+ 	return ((hash >> SFE_IPV6_CONNECTION_HASH_SHIFT) ^ hash) & SFE_IPV6_CONNECTION_HASH_MASK;
+ }
+ 
+@@ -1236,6 +1236,10 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		ether_addr_copy(reply_cm->pppoe_remote_mac, msg->pppoe_rule.return_pppoe_remote_mac);
+ 	}
+ 
++	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_SRC_INTERFACE_CHECK) {
++		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK;
++	}
++
+ 	/*
+ 	 * For the non-arp interface, we don't write L2 HDR.
+ 	 * Excluding PPPoE from this, since we are now supporting PPPoE encap/decap.
+@@ -1428,6 +1432,10 @@ int sfe_ipv6_create_rule(struct sfe_ipv6
+ 		}
+ 	}
+ 
++	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_SRC_INTERFACE_CHECK) {
++		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK;
++	}
++
+ 	/*
+ 	 * For the non-arp interface, we don't write L2 HDR.
+ 	 * Excluding PPPoE from this, since we are now supporting PPPoE encap/decap.
+--- a/sfe_ipv6.h
++++ b/sfe_ipv6.h
+@@ -81,6 +81,8 @@ struct sfe_ipv6_tcp_connection_match {
+ 					/* set skb mark*/
+ #define SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG (1<<12)
+ 					/* Insert VLAN tag */
++#define SFE_IPV6_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK (1<<13)
++					/* Source interface check.*/
+ 
+ /*
+  * IPv6 connection matching structure.
+@@ -271,6 +273,7 @@ enum sfe_ipv6_exception_events {
+ 	SFE_IPV6_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME,
+ 	SFE_IPV6_EXCEPTION_EVENT_NOT_ENOUGH_HEADROOM,
+ 	SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH,
++	SFE_IPV6_EXCEPTION_EVENT_INVALID_SRC_IFACE,
+ 	SFE_IPV6_EXCEPTION_EVENT_LAST
+ };
+ 
+--- a/sfe_ipv6_tcp.c
++++ b/sfe_ipv6_tcp.c
+@@ -191,6 +191,24 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	}
+ 
+ 	/*
++	 * Source interface validate.
++	 */
++	if (unlikely((cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK) && (cm->match_dev != dev))) {
++		struct sfe_ipv6_connection *c = cm->connection;
++		spin_lock_bh(&si->lock);
++		ret = sfe_ipv6_remove_connection(si, c);
++		spin_unlock_bh(&si->lock);
++
++		if (ret) {
++			sfe_ipv6_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
++		}
++		rcu_read_unlock();
++		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INVALID_SRC_IFACE);
++		DEBUG_TRACE("flush on wrong source interface check failure\n");
++		return 0;
++	}
++
++	/*
+ 	 * If our packet has been marked as "flush on find" we can't actually
+ 	 * forward it in the fast path, but now that we've found an associated
+ 	 * connection we can flush that out before we process the packet.
+@@ -658,7 +676,6 @@ int sfe_ipv6_recv_tcp(struct sfe_ipv6 *s
+ 	xmit_dev = cm->xmit_dev;
+ 	skb->dev = xmit_dev;
+ 
+-
+ 	/*
+ 	 * Check to see if we need to add VLAN tags
+ 	 */
+--- a/sfe_ipv6_udp.c
++++ b/sfe_ipv6_udp.c
+@@ -201,6 +201,24 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *s
+ 	}
+ 
+ 	/*
++	 * Source interface validate.
++	 */
++	if (unlikely((cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK) && (cm->match_dev != dev))) {
++		struct sfe_ipv6_connection *c = cm->connection;
++		spin_lock_bh(&si->lock);
++		ret = sfe_ipv6_remove_connection(si, c);
++		spin_unlock_bh(&si->lock);
++
++		if (ret) {
++			sfe_ipv6_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
++		}
++		rcu_read_unlock();
++		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INVALID_SRC_IFACE);
++		DEBUG_TRACE("flush on wrong source interface check failure\n");
++		return 0;
++	}
++
++	/*
+ 	 * If our packet has been marked as "flush on find" we can't actually
+ 	 * forward it in the fast path, but now that we've found an associated
+ 	 * connection we can flush that out before we process the packet.
